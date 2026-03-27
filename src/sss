@@ -1218,6 +1218,280 @@ def search_direct_filter(milestone_only: bool = False, deployed_only: bool = Fal
     return results
 
 
+# --- Analytics ---
+
+_FRICTION_TERMS = [
+    "again", "same issue", "same problem", "same error", "still not",
+    "keeps", "wieder", "immer noch", "nochmal", "schon wieder",
+    "failed again", "broken again", "not working", "doesn't work",
+    "funktioniert nicht", "klappt nicht", "geht nicht",
+]
+
+_ERROR_TERMS = [
+    "error", "fehler", "exception", "traceback", "failed", "failure",
+    "crash", "bug", "broken", "TypeError", "AttributeError", "KeyError",
+    "404", "500", "403", "401", "timeout", "exit 1", "exit code 1",
+]
+
+def _bar(val: int, max_val: int, width: int = 28) -> str:
+    if max_val == 0:
+        return " " * width
+    filled = int(round(val / max_val * width))
+    return "█" * filled + "░" * (width - filled)
+
+def analyze(mode: str):
+    """
+    Analytics over the full session index.
+
+    mode: 'topics' | 'projects' | 'errors' | 'friction' | 'timeline' | <keyword>
+    """
+    conn = get_db()
+
+    # ── Topic-Ranking ──────────────────────────────────────────────────────
+    if mode == "topics":
+        rows = conn.execute(
+            "SELECT topics, turn_count FROM sessions_meta WHERE topics IS NOT NULL"
+        ).fetchall()
+        counts: dict[str, int] = {}
+        for (topics_json, tc) in rows:
+            try:
+                for t in json.loads(topics_json):
+                    counts[t] = counts.get(t, 0) + 1
+            except Exception:
+                pass
+        if not counts:
+            print("No topic data found. Run: existenz --fingerprint-all")
+            return
+        ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        max_v = ranked[0][1]
+        total = sum(c for _, c in ranked)
+        print()
+        print("  ┌─────────────────────────────────────────────────────┐")
+        print("  │  TOPIC RANKING — Sessions per topic                 │")
+        print("  └─────────────────────────────────────────────────────┘")
+        print()
+        for topic, count in ranked[:20]:
+            pct = count / total * 100
+            bar = _bar(count, max_v)
+            print(f"  {topic:<22} {bar}  {count:>4} sessions  ({pct:.1f}%)")
+        print()
+        print(f"  {len(ranked)} topics total · {total} sessions analyzed")
+        print()
+
+    # ── Project-Stats ──────────────────────────────────────────────────────
+    elif mode == "projects":
+        rows = conn.execute("""
+            SELECT project,
+                   COUNT(*) as sessions,
+                   SUM(turn_count) as turns,
+                   SUM(active_minutes) as mins,
+                   SUM(milestone_detected) as milestones,
+                   SUM(deploy_detected) as deploys
+            FROM sessions_meta
+            GROUP BY project
+            ORDER BY sessions DESC
+            LIMIT 25
+        """).fetchall()
+        if not rows:
+            print("No project data found.")
+            return
+        max_s = max(r[1] for r in rows)
+        print()
+        print("  ┌───────────────────────────────────────────────────────────────┐")
+        print("  │  PROJECT ANALYTICS                                            │")
+        print("  └───────────────────────────────────────────────────────────────┘")
+        print()
+        print(f"  {'Project':<32} {'Sessions':>8} {'Turns':>7} {'Hours':>6} {'✓':>5} {'🚀':>5}")
+        print(f"  {'─'*32} {'─'*8} {'─'*7} {'─'*6} {'─'*5} {'─'*5}")
+        for (proj, sessions, turns, mins, milestones, deploys) in rows:
+            hours = (mins or 0) / 60
+            bar = _bar(sessions, max_s, 14)
+            name = (proj or "—")[:31]
+            print(f"  {name:<32} {bar} {sessions:>3}   {turns or 0:>7}  {hours:>5.1f}h  {milestones or 0:>4}  {deploys or 0:>4}")
+        print()
+        total_sessions = sum(r[1] for r in rows)
+        total_hours = sum((r[3] or 0) for r in rows) / 60
+        print(f"  Total: {total_sessions} sessions · {total_hours:.0f}h working time")
+        print()
+
+    # ── Error-Analysis ─────────────────────────────────────────────────────
+    elif mode == "errors":
+        pattern = " OR ".join(f'"{t}"' for t in _ERROR_TERMS[:12])
+        rows = conn.execute(f"""
+            SELECT strftime('%Y-%W', timestamp) as week,
+                   session_id, project, text
+            FROM turns_fts
+            WHERE turns_fts MATCH ?
+            ORDER BY timestamp DESC
+            LIMIT 500
+        """, (pattern,)).fetchall()
+
+        by_project: dict[str, int] = {}
+        by_week: dict[str, int] = {}
+        for (week, sid, proj, text) in rows:
+            by_project[proj or "—"] = by_project.get(proj or "—", 0) + 1
+            by_week[week or "—"]    = by_week.get(week or "—", 0) + 1
+
+        print()
+        print("  ┌─────────────────────────────────────────────────────┐")
+        print("  │  ERROR ANALYSIS — Errors & problems by project      │")
+        print("  └─────────────────────────────────────────────────────┘")
+        print()
+        print(f"  {len(rows)} error turns found\n")
+        ranked_proj = sorted(by_project.items(), key=lambda x: x[1], reverse=True)
+        max_p = ranked_proj[0][1] if ranked_proj else 1
+        print("  Errors by project:")
+        for proj, count in ranked_proj[:15]:
+            bar = _bar(count, max_p)
+            print(f"  {(proj or '—'):<28} {bar}  {count:>4}x")
+        print()
+        ranked_weeks = sorted(by_week.items(), key=lambda x: x[0])[-12:]
+        if ranked_weeks:
+            max_w = max(v for _, v in ranked_weeks)
+            print("  Trend (last 12 weeks):")
+            for week, count in ranked_weeks:
+                bar = _bar(count, max_w, 20)
+                print(f"  KW {week:<8} {bar}  {count:>3}x")
+        print()
+
+    # ── Friction-Analysis ──────────────────────────────────────────────────
+    elif mode == "friction":
+        pattern = " OR ".join(f'"{t}"' for t in _FRICTION_TERMS if " " not in t)
+        rows = conn.execute(f"""
+            SELECT s.topics, s.project, t.text, t.timestamp
+            FROM turns_fts t
+            JOIN sessions_meta s ON t.session_id = s.session_id
+            WHERE t.turns_fts MATCH ?
+            ORDER BY t.timestamp DESC
+            LIMIT 800
+        """, (pattern,)).fetchall()
+
+        friction: dict[str, int] = {}
+        proj_friction: dict[str, int] = {}
+        for (topics_json, proj, text, ts) in rows:
+            proj_friction[proj or "—"] = proj_friction.get(proj or "—", 0) + 1
+            try:
+                for t in json.loads(topics_json or "[]"):
+                    friction[t] = friction.get(t, 0) + 1
+            except Exception:
+                pass
+
+        print()
+        print("  ┌─────────────────────────────────────────────────────┐")
+        print("  │  FRICTION ANALYSIS — Recurring pain points          │")
+        print("  └─────────────────────────────────────────────────────┘")
+        print()
+        print(f"  {len(rows)} turns with repetition signals found\n")
+
+        print("  Friction by project:")
+        ranked_pf = sorted(proj_friction.items(), key=lambda x: x[1], reverse=True)
+        max_pf = ranked_pf[0][1] if ranked_pf else 1
+        for proj, count in ranked_pf[:12]:
+            bar = _bar(count, max_pf)
+            label = "⚠️ " if count >= max_pf * 0.5 else "   "
+            print(f"  {label}{(proj or '—'):<26} {bar}  {count:>4}x")
+        print()
+
+        if friction:
+            print("  Friction by topic:")
+            ranked_f = sorted(friction.items(), key=lambda x: x[1], reverse=True)
+            max_f = ranked_f[0][1]
+            for topic, count in ranked_f[:12]:
+                bar = _bar(count, max_f)
+                print(f"  {topic:<28} {bar}  {count:>4}x")
+        print()
+
+    # ── Timeline / Activity Heatmap ────────────────────────────────────────
+    elif mode == "timeline":
+        rows = conn.execute("""
+            SELECT strftime('%Y-%W', first_ts) as week,
+                   COUNT(*) as sessions,
+                   SUM(turn_count) as turns
+            FROM sessions_meta
+            WHERE first_ts IS NOT NULL
+            GROUP BY week
+            ORDER BY week
+        """).fetchall()
+        if not rows:
+            print("No timeline data.")
+            return
+        rows = rows[-24:]
+        max_s = max(r[1] for r in rows)
+        print()
+        print("  ┌─────────────────────────────────────────────────────┐")
+        print("  │  ACTIVITY TIMELINE — Sessions per week              │")
+        print("  └─────────────────────────────────────────────────────┘")
+        print()
+        for (week, sessions, turns) in rows:
+            bar = _bar(sessions, max_s, 32)
+            intensity = "🔥" if sessions >= max_s * 0.8 else ("📈" if sessions >= max_s * 0.4 else "·")
+            print(f"  {intensity} KW {week}  {bar}  {sessions:>3} sessions  ({turns or 0} turns)")
+        print()
+        total = sum(r[1] for r in rows)
+        avg = total / len(rows)
+        print(f"  Ø {avg:.1f} sessions/week · {total} sessions over {len(rows)} weeks")
+        print()
+
+    # ── Keyword-Analysis ───────────────────────────────────────────────────
+    else:
+        keyword = mode
+        rows = conn.execute("""
+            SELECT strftime('%Y-%W', timestamp) as week,
+                   project, session_id, text
+            FROM turns_fts
+            WHERE turns_fts MATCH ?
+            ORDER BY timestamp ASC
+            LIMIT 1000
+        """, (f'"{keyword}"',)).fetchall()
+
+        if not rows:
+            rows = conn.execute("""
+                SELECT strftime('%Y-%W', timestamp) as week,
+                       project, session_id, text
+                FROM turns_fts
+                WHERE turns_fts MATCH ?
+                ORDER BY timestamp ASC
+                LIMIT 1000
+            """, (keyword,)).fetchall()
+
+        if not rows:
+            print(f'\n  No results for "{keyword}"\n')
+            return
+
+        by_week: dict[str, int] = {}
+        by_proj: dict[str, int] = {}
+        sessions: set[str] = set()
+        for (week, proj, sid, text) in rows:
+            by_week[week or "—"] = by_week.get(week or "—", 0) + 1
+            by_proj[proj or "—"] = by_proj.get(proj or "—", 0) + 1
+            sessions.add(sid)
+
+        print()
+        print(f'  ┌─────────────────────────────────────────────────────┐')
+        print(f'  │  KEYWORD ANALYSIS — "{keyword}"')
+        print(f'  └─────────────────────────────────────────────────────┘')
+        print()
+        print(f"  {len(rows)} mentions · {len(sessions)} sessions · {len(by_proj)} projects\n")
+
+        print("  Frequency by project:")
+        ranked_p = sorted(by_proj.items(), key=lambda x: x[1], reverse=True)
+        max_p = ranked_p[0][1]
+        for proj, count in ranked_p[:10]:
+            bar = _bar(count, max_p)
+            print(f"  {(proj or '—'):<28} {bar}  {count:>4}x")
+        print()
+
+        weeks = sorted(by_week.items())[-16:]
+        if weeks:
+            max_w = max(v for _, v in weeks)
+            print("  Trend over time:")
+            for week, count in weeks:
+                bar = _bar(count, max_w, 24)
+                trend = "↑" if count >= max_w * 0.6 else ("↓" if count <= max_w * 0.2 else "→")
+                print(f"  {trend} KW {week}  {bar}  {count:>3}x")
+        print()
+
+
 # --- Projekt-Briefing ---
 def generate_briefing(project_name: str):
     """
@@ -1480,7 +1754,9 @@ def main():
     parser.add_argument("--open", metavar="TOPIC", default=None,
                         help="Letzte offene (nicht abgeschlossene) Session zu einem Topic finden")
     parser.add_argument("--continuation", metavar="TOPIC", default=None,
-                        help="Finde Vorgänger-Session von heute zu einem Topic (Session-Ketten)")
+                        help="Find predecessor sessions for a topic (session chains)")
+    parser.add_argument("--analyze", metavar="MODE", default=None,
+                        help="Analytics: topics | projects | errors | friction | timeline | <keyword>")
 
     args = parser.parse_args()
 
@@ -1583,6 +1859,10 @@ def main():
             print(f"\n  [LETZTER STAND] {ts[:16]}  [{sid_short}]  ({tc} Turns)  {status}")
             print(f"          \033[36m→ read-session {sid_short} --last 5\033[0m")
         print()
+        return
+
+    if args.analyze:
+        analyze(args.analyze)
         return
 
     if args.briefing:

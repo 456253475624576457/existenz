@@ -191,6 +191,35 @@ The fix that took two hours the first time takes two minutes the second.
 
 ---
 
+### 📊 Understand how you actually work
+
+**The situation:** You want to know where you've been spending your time — which projects, which topics, where problems keep coming back.
+
+**What you do:** `existenz --analyze topics`
+
+**What you get:**
+
+```
+  briefadler             ████████████████████████████   249 sessions  (20.0%)
+  seo                    █████████████████████████░░░   223 sessions  (18.0%)
+  cloudflare             ████████████████████████░░░░   217 sessions  (17.5%)
+  ...
+  12 topics total · 1242 sessions analyzed
+```
+
+Six analytics modes, no setup required:
+
+| Mode | What it shows |
+|---|---|
+| `--analyze topics` | Topic ranking — which subjects dominate your session history |
+| `--analyze projects` | Sessions, turns, hours, milestones, and deploys per project |
+| `--analyze errors` | Error frequency by project and week — where things break most |
+| `--analyze friction` | Recurring pain points — "same issue again", "still not working" |
+| `--analyze timeline` | Activity heatmap — when you were most active, week by week |
+| `--analyze <keyword>` | Any keyword's frequency over time and across projects |
+
+---
+
 ## 🏗️ Architecture
 
 ### Indexing — runs silently after every response
@@ -316,6 +345,14 @@ existenz --briefing "project"           # Full project re-onboarding
 read-session <id> --last 5              # Last N message pairs, exact wording
 read-session <id> --context             # Smart summary, optimized to resume
 read-session <id> --full                # Complete session, untruncated
+
+# Analyze
+existenz --analyze topics               # Topic ranking across all sessions
+existenz --analyze projects             # Sessions, turns, hours per project
+existenz --analyze errors               # Error frequency by project and week
+existenz --analyze friction             # Recurring pain points and blockers
+existenz --analyze timeline             # Activity heatmap — sessions per week
+existenz --analyze "keyword"            # Frequency trend for any keyword
 
 # Index
 existenz --index                        # Incremental update (auto via hook)

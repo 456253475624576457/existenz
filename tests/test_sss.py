@@ -143,3 +143,86 @@ def test_env_var_sessions_dir(tmp_path):
     """SSS_SESSIONS_DIR must override default SESSIONS_BASE."""
     mod = _load_sss({"SSS_SESSIONS_DIR": str(tmp_path)})
     assert mod.SESSIONS_BASE == tmp_path
+
+
+# ── 6. analyze() — analytics engine ─────────────────────────────────────────
+
+def _make_test_db(tmp_path):
+    """Create a minimal populated DB for analytics tests."""
+    import sqlite3
+    db_path = str(tmp_path / "test-analyze.db")
+    mod = _load_sss({"SSS_INDEX_DB": db_path})
+    conn = mod.get_db()
+    # Insert two sessions with topics and metadata
+    conn.execute("""
+        INSERT OR IGNORE INTO sessions_meta
+            (session_id, project, first_ts, last_ts, turn_count, active_minutes,
+             milestone_detected, deploy_detected, topics)
+        VALUES
+            ('aaaa', 'project-alpha', '2026-01-10T10:00:00', '2026-01-10T11:00:00',
+             20, 60, 1, 0, '["seo", "cloudflare"]'),
+            ('bbbb', 'project-alpha', '2026-01-17T10:00:00', '2026-01-17T11:30:00',
+             15, 90, 0, 1, '["briefadler", "cloudflare"]'),
+            ('cccc', 'project-beta',  '2026-01-24T09:00:00', '2026-01-24T09:30:00',
+             8,  30, 0, 0, '["seo"]')
+    """)
+    conn.execute("""
+        INSERT INTO turns_fts (session_id, project, role, timestamp, text)
+        VALUES
+            ('aaaa', 'project-alpha', 'user',      '2026-01-10T10:00:00', 'deployment error traceback in wrangler'),
+            ('bbbb', 'project-alpha', 'assistant', '2026-01-17T10:00:00', 'same issue again with cloudflare'),
+            ('cccc', 'project-beta',  'user',      '2026-01-24T09:00:00', 'seo analysis completed successfully')
+    """)
+    conn.commit()
+    conn.close()
+    return mod, db_path
+
+
+def test_analyze_topics_runs(tmp_path, capsys):
+    mod, db_path = _make_test_db(tmp_path)
+    mod.analyze("topics")
+    out = capsys.readouterr().out
+    assert "cloudflare" in out
+    assert "seo" in out
+
+
+def test_analyze_projects_runs(tmp_path, capsys):
+    mod, db_path = _make_test_db(tmp_path)
+    mod.analyze("projects")
+    out = capsys.readouterr().out
+    assert "project-alpha" in out
+
+
+def test_analyze_errors_runs(tmp_path, capsys):
+    mod, db_path = _make_test_db(tmp_path)
+    mod.analyze("errors")
+    out = capsys.readouterr().out
+    assert "error" in out.lower() or "turns" in out.lower()
+
+
+def test_analyze_friction_runs(tmp_path, capsys):
+    mod, db_path = _make_test_db(tmp_path)
+    mod.analyze("friction")
+    out = capsys.readouterr().out
+    assert "friction" in out.lower() or "pain" in out.lower() or "turns" in out.lower()
+
+
+def test_analyze_timeline_runs(tmp_path, capsys):
+    mod, db_path = _make_test_db(tmp_path)
+    mod.analyze("timeline")
+    out = capsys.readouterr().out
+    assert "sessions" in out.lower()
+
+
+def test_analyze_keyword_runs(tmp_path, capsys):
+    mod, db_path = _make_test_db(tmp_path)
+    mod.analyze("wrangler")
+    out = capsys.readouterr().out
+    assert "wrangler" in out.lower()
+
+
+def test_analyze_keyword_no_results(tmp_path, capsys):
+    mod, db_path = _make_test_db(tmp_path)
+    mod.analyze("xyznotexistentterm12345")
+    out = capsys.readouterr().out
+    assert "No results" in out or "no results" in out.lower()
