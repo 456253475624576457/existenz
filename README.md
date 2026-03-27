@@ -17,16 +17,15 @@ All of it — **searchable, reconstructable, permanent.**
 
 ---
 
-## The problem nobody talks about
+## The problem everyone knows — and nobody has solved well
 
-You use Claude Code every day. Each session, you build context — architecture decisions, discovered gotchas, hard-won fixes. Then the session ends.
+Claude Code is stateless. Every session starts fresh. This is one of the most commonly raised frustrations in the Claude Code community — and rightfully so.
 
-Next time you start fresh. You re-explain. You re-discover. You re-fix.
+You build context over hundreds of sessions: architecture decisions, discovered gotchas, hard-won fixes. Then the session ends. Next time you re-explain, re-discover, re-fix. The knowledge exists in JSONL files on your disk — but you have no way to get to it.
 
-After 100 sessions: a graveyard of lost knowledge.
-After 500 sessions: thousands of hours that simply don't exist anymore.
+The existing tools give you keyword search or semantic search. Not both. No session fingerprinting. No continuation mode. No conversation reconstruction. Just grep on a different surface.
 
-**ExistenZ makes them exist.**
+**ExistenZ is the version that actually solves it.**
 
 ---
 
