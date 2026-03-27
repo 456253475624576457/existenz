@@ -200,11 +200,13 @@ The fix that took two hours the first time takes two minutes the second.
 **What you get:**
 
 ```
-  briefadler             ████████████████████████████   249 sessions  (20.0%)
-  seo                    █████████████████████████░░░   223 sessions  (18.0%)
-  cloudflare             ████████████████████████░░░░   217 sessions  (17.5%)
+  backend-api            ████████████████████████████   312 sessions  (24.1%)
+  authentication         █████████████████████████░░░   289 sessions  (22.3%)
+  deployment             ████████████████████████░░░░   241 sessions  (18.6%)
+  database               ████████████████░░░░░░░░░░░░   178 sessions  (13.7%)
+  frontend               ██████████░░░░░░░░░░░░░░░░░░   113 sessions  (8.7%)
   ...
-  12 topics total · 1242 sessions analyzed
+  12 topics total · 1294 sessions analyzed
 ```
 
 Six analytics modes, no setup required:
