@@ -7,236 +7,146 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-22c55e?style=flat-square)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-15%20passed-22c55e?style=flat-square)](tests/)
-[![Sessions](https://img.shields.io/badge/battle--tested-500%2B%20sessions-8b5cf6?style=flat-square)](#)
+[![Battle-tested](https://img.shields.io/badge/battle--tested-500%2B%20sessions-8b5cf6?style=flat-square)](#)
 [![Offline](https://img.shields.io/badge/100%25%20offline-no%20API%20calls-0ea5e9?style=flat-square)](#)
-
-Every decision you made. Every insight you reached. Every conversation you had.<br>
-All of it — **searchable, reconstructable, permanent.**
 
 </div>
 
 ---
 
-## The problem everyone knows — and nobody has solved well
+## The problem
 
-Claude Code is stateless. Every session starts fresh.
+Claude Code is stateless. Every session starts fresh — by design.
 
-This is one of the most commonly raised frustrations in the Claude Code community — and across every kind of work. Not just code. Writing. Research. Strategy. Client work. SEO. Analysis. Any complex, ongoing work where context matters.
+This is one of the most discussed frustrations in the Claude Code community, and it affects every kind of work: code, writing, research, strategy, client projects, SEO, content. You build up knowledge across hundreds of sessions. You make decisions, develop approaches, reach conclusions. Then the session ends — and the next time you open Claude Code, all of that is gone.
 
-You build knowledge over hundreds of sessions. You make decisions, reach conclusions, develop approaches. Then the session ends. The next time you open Claude Code, everything is gone. The knowledge lives in JSONL files on your disk — but you have no way to get back to it.
+The knowledge still exists. It lives in session files on your disk. But there's no way to get back to it.
 
-**The result:** You re-explain context you've explained before. You re-discover things you already knew. You lose the thread of work that spanned multiple sessions.
+So you re-explain context you've already explained. You re-discover things you already figured out. You start conversations that should take 5 minutes from scratch because you can't find the thread.
 
-The existing tools give you keyword search or semantic search — not both. No session fingerprinting. No continuation mode. No reconstruction. Just grep on a different surface.
+**After 100 sessions, this is annoying. After 500 sessions, it's a serious productivity problem.**
 
-**ExistenZ is the version that actually solves it.**
+The existing tools help at the margins — basic keyword search, or semantic search, each on its own. But none of them offer the full picture: no hybrid search that combines both, no session fingerprinting, no continuation mode, no conversation reconstruction.
+
+ExistenZ is the version that actually solves it.
 
 ---
 
-## Who uses ExistenZ
+## What ExistenZ does
 
-ExistenZ is for anyone who uses Claude Code for ongoing, complex work — regardless of the domain.
+ExistenZ runs silently in the background. After every single Claude Code response, a hook automatically indexes the session — incrementally, in under two seconds, without interrupting anything.
 
-| If you work with... | ExistenZ helps you... |
+The result is a searchable archive of your entire Claude Code history. Hybrid search combines exact text matching with semantic understanding, so you find what you're looking for even when you don't remember the precise words. Session fingerprinting classifies every session by type and topic. And when you find what you need, you can reconstruct the full conversation context and paste it directly into a new session.
+
+Everything runs locally. No cloud, no API calls, no data leaving your machine.
+
+---
+
+## Who it's for
+
+ExistenZ works for anyone who uses Claude Code for ongoing, complex work — not just developers.
+
+| Domain | What becomes searchable |
 |---|---|
-| **Code & development** | Find past fixes, reconstruct architectural decisions, resume refactors |
-| **Content & writing** | Recover tone guidelines, find approved drafts, continue multi-session projects |
-| **SEO & marketing** | Retrieve keyword decisions, find competitor analyses, track what's been published |
-| **Research & analysis** | Reconstruct findings, recover source lists, continue multi-week research |
-| **Strategy & business** | Find past decisions, recover client briefs, track what was agreed |
-| **Any project with clients** | Know what was discussed, what was delivered, what's still open |
+| **Development** | Architecture decisions, bug fixes, code patterns, deployment history |
+| **Content & writing** | Tone guidelines, approved drafts, client feedback, style decisions |
+| **SEO & marketing** | Keyword strategies, competitor analyses, campaign decisions |
+| **Research & analysis** | Findings, source lists, conclusions, methodology decisions |
+| **Strategy & consulting** | Client briefs, recommendations, decisions, open questions |
+| **Any project work** | What was discussed, what was delivered, what's still open |
 
 ---
 
-## How it looks in practice
+## How it looks
 
 ```
-$ existenz "what tone and structure did we agree on for the newsletter" --hybrid
+$ existenz "what tone did we agree on for the newsletter" --hybrid
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ExistenZ  ·  HYBRID (BM25 + Semantic)  ·  0.24s
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  [1] 2026-03-18  client-acme / 7f2b1c9a
+  [1] 2026-03-18  client-project  7f2b1c9a
       "agreed: direct, no corporate language, max 3 paragraphs per section,
        always end with one concrete next step — no vague CTAs"
       → read-session 7f2b1c9a --last 5
 
-  [2] 2026-03-04  content-strategy / 4d8e3f11
+  [2] 2026-03-04  content-strategy  4d8e3f11
       "client rejected formal tone in v2 — wants conversational, first person,
        short sentences. Reference: the onboarding email they sent us."
       → read-session 4d8e3f11 --context
 ```
 
-```
-$ read-session 7f2b1c9a --last 5
-
-[2026-03-18 11:14] YOU
-  The client came back on the draft. They want it shorter and less formal.
-
-[2026-03-18 11:14] CLAUDE
-  Based on their feedback: cut the intro paragraph entirely, replace bullet
-  lists with flowing sentences, and move the CTA to the second paragraph.
-  Their reference email uses "you" not "the reader" — match that throughout.
-
-[2026-03-18 11:19] YOU
-  That worked. They approved the revised version.
-
-[2026-03-18 11:19] CLAUDE
-  Good. For future drafts: direct address, max 180 words per section,
-  CTA always in paragraph 2. I'll apply this as the default for this client.
-```
-
-Exact context. Exact decisions. Back in 10 seconds.
+The session IDs lead directly to the full conversation. `read-session 7f2b1c9a --last 5` gives you the exact last 5 message pairs — word for word — ready to paste as context into a new session.
 
 ---
 
-## Real-world use cases
+## Use cases
 
-### 1 — Pick up where you left off
+### Pick up where you left off
 
-You were deep in a complex project yesterday — research, strategy, a client brief, a piece of code. Today you open a new session with zero context.
+You were deep in a project yesterday — a client brief, a piece of research, a refactor, a content strategy. Today you open a new session with zero context.
 
-```bash
-$ existenz --continuation "client-acme"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  CONTINUATION — last 48h — "client-acme"
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  Yesterday (2026-03-26, 15:12–18:30, ~38 turns)
-  Session: 7f3a9b2c
-  Topics:  newsletter · tone · approval · cta
-  Status:  in progress — no milestone detected
-
-  Last message:
-  "Draft v3 is approved. Still need to finalize the subject line variants
-   and schedule — that was the open item at the end of the session."
-
-  → read-session 7f3a9b2c --context   (full context to resume)
-  → read-session 7f3a9b2c --last 5    (exact last messages)
-```
-
-Paste the context into your new session. You're back in 10 seconds.
+`existenz --continuation "project-name"` finds your most recent sessions, shows their topics, the open threads, and the exact last message. You call `read-session` on the most relevant one and paste the context into the new session. You're back in 10 seconds instead of 10 minutes.
 
 ---
 
-### 2 — Recover a decision from months ago
+### Recover a decision
 
-Something comes up that you know you've dealt with before. You know the answer exists — somewhere.
+Something comes up that you know you've worked through before — a client preference, a pricing decision, an architectural tradeoff, a writing guideline. You know the answer is in there somewhere.
 
-```bash
-$ existenz "what did we decide about the pricing structure" --hybrid
-
-  [1] 2026-01-09  strategy / c3d1e8f2
-      "agreed: value-based pricing, not hourly — three tiers, middle tier
-       positioned as default. No discounts in year one."
-      → read-session c3d1e8f2 --context
-```
-
-The decision. The reasoning. The tradeoffs. All still there.
+`existenz "what we decided about X" --hybrid` combines exact and semantic search to find it even if you don't remember the precise words used. The result shows you the session, the project, and the relevant excerpt — with a direct pointer to read the full context.
 
 ---
 
-### 3 — Reconstruct a client brief
+### Reconstruct a client brief
 
-You're starting a new piece of work for a client. You want to go back to the original briefing conversation.
+You're starting a new piece of work and want to go back to the original briefing. What was the target audience? What tone did they ask for? What were the constraints?
 
-```bash
-$ existenz "initial briefing target audience brand voice" --semantic
-
-  [1] 2025-11-21  client-project / a9b7c5d3
-      "target: 35-55, professional, time-poor. Brand voice: expert but
-       accessible. Avoid jargon. Competitor brands: X, Y — differentiate
-       by being warmer and more direct."
-      → read-session a9b7c5d3 --context
-```
+`existenz "briefing target audience brand voice" --semantic` finds conceptually related sessions even if those exact words weren't used. The semantic engine understands what you mean, not just what you typed.
 
 ---
 
-### 4 — Find everything you shipped
+### See everything that's been completed
 
-You need a full picture of what's been completed — for a retrospective, a client report, or just to know where things stand.
+You need a full picture of what's been finished — for a retrospective, a client report, or just to know where things stand across a project.
 
-```bash
-$ existenz --milestone --since 2026-01-01
-
-  ✓ 2026-03-22  homepage redesign — delivered to client
-  ✓ 2026-03-14  SEO audit — report sent
-  ✓ 2026-02-28  product descriptions — 47 texts live
-  ✓ 2026-02-11  competitor analysis — approved
-  ✓ 2026-01-30  content strategy — v2 signed off
-```
+`existenz --milestone` lists all sessions where a meaningful completion was detected: a delivery approved, content published, a feature shipped, a report sent. Filtered by project or date as needed.
 
 ---
 
-### 5 — Re-onboard after a break
+### Re-onboard after a break
 
-Coming back after two weeks off a project. You need the full picture — current state, open threads, key decisions — before touching anything.
+Coming back after two weeks away from a project. Before touching anything, you need the full picture — current state, what's complete, what's still open, which threads need to be picked up.
 
-```bash
-$ existenz --briefing "my-project"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  PROJECT BRIEFING — "my-project"
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  44 sessions · 1,580 turns · last active: 2026-03-12
-
-  Completed:
-  ✓ 2026-03-10  landing page v2
-  ✓ 2026-03-05  email sequence — 5 messages
-
-  In progress:
-  ✗ 2026-03-12  product page rewrite — open, no completion
-
-  Open threads:
-  → read-session a1b2c3d4 --context   (product page)
-  → read-session e5f6a7b8 --context   (SEO meta texts)
-```
+`existenz --briefing "project-name"` generates a structured project overview: session count, completed milestones, in-progress items, and direct pointers to the most relevant sessions to read for context.
 
 ---
 
-### 6 — Pull a specific quote or fact
+### Pull a specific fact or quote
 
-You remember Claude gave you a specific number, source, or recommendation weeks ago — and you need it now.
+You remember Claude gave you a specific benchmark, recommendation, or source reference weeks ago — and you need it now.
 
-```bash
-$ existenz "conversion rate benchmark ecommerce" --hybrid
-
-  [1] 2026-02-14  research / d4e5f6a7
-      "industry benchmark: 1.5–3% for general ecommerce, 3–5% for niche.
-       Source discussed: Baymard Institute 2025 report."
-      → read-session d4e5f6a7 --last 5
-```
+`existenz "conversion rate benchmark ecommerce" --hybrid` finds it. Exact results, exact session, exact context. No re-researching what you've already researched.
 
 ---
 
-### 7 — For developers: rediscover a fix
+### For developers: find the fix
 
-A problem that looks familiar. You know you've solved this before.
+A problem that looks familiar. You're sure you've solved something similar before, on a different project or three months ago.
 
-```bash
-$ existenz "CORS 403 only on POST requests" --hybrid
-
-  [1] 2026-01-12  api-gateway / b3c1d9f0
-      "nginx was stripping Authorization header on preflight — fixed with
-       proxy_pass_header + explicit OPTIONS handling in location block"
-      → read-session b3c1d9f0 --last 5
-```
+`existenz "CORS 403 on POST requests" --hybrid` finds the session, the diagnosis, and the exact fix. The fix that took two hours the first time takes two minutes the second.
 
 ---
 
 ## Architecture
 
-### Indexing — runs silently after every response
+### Indexing — runs after every response
 
 ```mermaid
 flowchart LR
-    A([Claude Code\nSession]) -->|Stop event fires| B[ExistenZ\nStop Hook]
-    B -->|background, ~2s| C{Incremental\nIndexer}
-    C -->|new turns only| D[(SQLite\nFTS5\nfull-text)]
-    C -->|new turns only| E[(ONNX\nEmbeddings\n.npy)]
+    A([Claude Code\nSession]) -->|Stop event| B[ExistenZ\nHook]
+    B -->|background\n~2 seconds| C{Incremental\nIndexer}
+    C --> D[(SQLite\nFTS5\nfull-text)]
+    C --> E[(ONNX\nEmbeddings)]
     C --> F[(Session\nMetadata +\nFingerprint)]
 
     style A fill:#1e1e2e,color:#cdd6f4,stroke:#45475a
@@ -245,65 +155,61 @@ flowchart LR
     style F fill:#1e3a5f,color:#cdd6f4,stroke:#45475a
 ```
 
-### Search — two engines, one ranking
+### Search — two engines, one result
 
 ```mermaid
-flowchart TD
-    Q([Your query]) --> B[BM25\nSQLite FTS5\nexact match]
-    Q --> S[Semantic\nONNX Embeddings\nmeaning match]
-    B -->|top-N| R[Reciprocal\nRank Fusion]
-    S -->|top-N| R
-    R --> OUT([Ranked results\n+ session IDs])
+flowchart LR
+    Q([Your query]) --> B[BM25\nexact match]
+    Q --> S[Semantic\nmeaning match]
+    B --> R[Reciprocal\nRank Fusion]
+    S --> R
+    R --> OUT([Ranked\nresults])
 
     style Q fill:#1e1e2e,color:#cdd6f4,stroke:#45475a
     style OUT fill:#1e1e2e,color:#cdd6f4,stroke:#45475a
     style R fill:#2d1b4e,color:#cdd6f4,stroke:#45475a
 ```
 
+**BM25** (SQLite FTS5) matches your exact words — fast and precise.
+**Semantic search** (ONNX embeddings, runs locally) matches your meaning — finds results even when the words differ.
+**Reciprocal Rank Fusion** merges both result lists into a single ranking that consistently outperforms either approach alone.
+
 ### Reconstruction — three modes
 
-```mermaid
-flowchart LR
-    ID([Session ID]) --> RS[read-session]
-    RS -->|--last 5| A[Last N messages\nexact wording]
-    RS -->|--context| B[Smart summary\n~5-8k tokens\noptimized to resume]
-    RS -->|--full| C[Complete session\nuntruncated]
+Once you have a session ID, `read-session` gives you the conversation back in whatever form you need:
 
-    style ID fill:#1e1e2e,color:#cdd6f4,stroke:#45475a
-```
-
-**BM25** finds what you search for literally — fast and precise.
-**Semantic** finds what you *mean* — even if you don't remember the exact words.
-**Reciprocal Rank Fusion** combines both lists into one ranking that beats either alone.
+- `--last 5` — the last 5 message pairs, exact wording, ready to paste as context
+- `--context` — a smart summary (~5–8k tokens) optimized for resuming work in a new session
+- `--full` — the complete session, untruncated
 
 ---
 
 ## Features
 
-| Feature | What it means |
+| Feature | What it means in practice |
 |---|---|
-| **Hybrid search** | BM25 (exact) + Semantic (meaning) via Reciprocal Rank Fusion |
-| **Session fingerprinting** | Every session auto-classified: deploy / milestone / topic |
-| **Continuation mode** | One command to resume exactly where you left off |
-| **Full reconstruction** | Read back any session — last N messages, smart summary, or complete |
-| **Multilingual** | German/English mixed, umlauts normalized, CamelCase split |
-| **100% offline** | ONNX embeddings run locally — nothing leaves your machine |
-| **Auto-indexed** | Stop Hook indexes every response in the background |
-| **Incremental** | Only new turns get indexed — under 2 seconds |
+| **Hybrid search** | Finds what you searched for *and* what you meant — BM25 + Semantic via RRF |
+| **Session fingerprinting** | Every session auto-tagged: deploy, milestone, or topic cluster |
+| **Continuation mode** | One command to see where you left off, across any project |
+| **Project briefing** | Full project re-onboarding: completed, in-progress, open threads |
+| **Conversation reconstruction** | Read back any session — last N messages, smart summary, or complete |
+| **Multilingual** | German/English mixed content, umlauts normalized, CamelCase split |
+| **100% offline** | ONNX embeddings run locally — nothing leaves your machine, ever |
+| **Zero-maintenance indexing** | Stop Hook indexes every response in the background automatically |
 
 ---
 
 ## vs. Alternatives
 
-| Feature | ExistenZ | [search-sessions](https://github.com/sinzin91/search-sessions) | [cc-conversation-search](https://github.com/akatz-ai/cc-conversation-search) |
-|---------|:--------:|:--------------:|:--------------------:|
+| | ExistenZ | [search-sessions](https://github.com/sinzin91/search-sessions) | [cc-conversation-search](https://github.com/akatz-ai/cc-conversation-search) |
+|---|:---:|:---:|:---:|
 | Hybrid BM25 + Semantic | ✅ | ❌ | ✅ |
 | Session fingerprinting | ✅ | ❌ | ❌ |
 | Continuation / briefing mode | ✅ | ❌ | ❌ |
-| Full conversation reconstruction | ✅ | ❌ | ❌ |
+| Conversation reconstruction | ✅ | ❌ | ❌ |
 | Multilingual | ✅ | ❌ | ❌ |
-| Auto-index via Stop Hook | ✅ | manual | manual |
-| Offline / no API | ✅ | ✅ | ✅ |
+| Auto-index via hook | ✅ | manual | manual |
+| Fully offline | ✅ | ✅ | ✅ |
 
 ---
 
@@ -323,60 +229,48 @@ cd existenz
 bash install.sh
 ```
 
-The installer handles everything:
+The installer handles everything in one step: installs dependencies, places the scripts, wires the Stop Hook into `~/.claude/settings.json`, and builds the initial index. The first run downloads the embedding model (~33 MB, one-time).
 
-```
-[existenz] Python 3.12 found.
-[existenz] Installing Python dependencies...
-[existenz] Installing existenz to ~/.claude/scripts/existenz...
-[existenz] Installing read-session to /usr/local/bin/read-session...
-[existenz] Wiring Stop Hook in ~/.claude/settings.json...
-           Stop Hook added: ~/.claude/scripts/existenz --index
-[existenz] Building initial search index...
-           → Downloading BAAI/bge-small-en-v1.5 (33MB, one-time)
-           → Indexed 247 sessions / 18,432 turns
-[existenz] Installation complete!
-```
-
-**Add to PATH if needed:**
 ```bash
+# Add to PATH if needed
 echo 'export PATH="$HOME/.claude/scripts:$PATH"' >> ~/.zshrc && source ~/.zshrc
 ```
 
-**Upgrade:** `bash install.sh --upgrade` · **Remove:** `bash install.sh --uninstall`
+```bash
+bash install.sh --upgrade    # Re-install over existing
+bash install.sh --uninstall  # Remove scripts and hook
+```
 
 ---
 
-## All commands
+## Commands
 
 ```bash
-# ── Search ─────────────────────────────────────────────────────────────────
-existenz "query"                       # BM25 — fast, exact match
-existenz "query" --hybrid              # Best quality: BM25 + Semantic
-existenz "query" --semantic            # Semantic — finds related concepts
-existenz "term1 term2 term3" --any     # OR logic — any term matches
-existenz "query" --since 2026-01-01   # Filter by date
-existenz "query" --deployed            # Only sessions with a deploy
-existenz "query" --milestone           # Only completed milestone sessions
-existenz "query" --unique              # One best result per session
-existenz "query" --role user           # Search only your messages
-existenz "query" --project "name"      # Limit to one project
+# Search
+existenz "query"                        # Exact match (BM25)
+existenz "query" --hybrid               # Exact + semantic — best quality
+existenz "query" --semantic             # Semantic only — finds related concepts
+existenz "term1 term2" --any            # OR logic
+existenz "query" --since 2026-01-01    # Filter by date
+existenz "query" --deployed             # Only sessions with a deploy
+existenz "query" --milestone            # Only completed milestone sessions
+existenz "query" --unique               # One result per session
+existenz "query" --project "name"       # Limit to one project
 
-# ── Resume ─────────────────────────────────────────────────────────────────
-existenz --continuation "project"      # Where was I in the last 48h?
-existenz --briefing "project"          # Full project re-onboarding
+# Resume
+existenz --continuation "project"       # Where was I in the last 48h?
+existenz --briefing "project"           # Full project re-onboarding
 
-# ── Reconstruct ────────────────────────────────────────────────────────────
-read-session <id> --last 5             # Last N message pairs — exact wording
-read-session <id> --context            # Smart summary, optimized to resume
-read-session <id> --full               # Everything, untruncated
-read-session <id> --summary            # Only auto-summaries Claude generated
+# Reconstruct
+read-session <id> --last 5              # Last N message pairs, exact wording
+read-session <id> --context             # Smart summary, optimized to resume
+read-session <id> --full                # Complete session, untruncated
 
-# ── Index ──────────────────────────────────────────────────────────────────
-existenz --index                       # Incremental update (auto-runs via hook)
-existenz --index --force               # Full rebuild from scratch
-existenz --stats                       # Index statistics
-existenz --fingerprint-all             # Classify all sessions (idempotent)
+# Index
+existenz --index                        # Incremental update (auto-runs via hook)
+existenz --index --force                # Full rebuild
+existenz --stats                        # Statistics
+existenz --fingerprint-all              # Classify all sessions
 ```
 
 ---
@@ -386,49 +280,39 @@ existenz --fingerprint-all             # Classify all sessions (idempotent)
 ### Environment variables
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `EXISTENZ_DATA_DIR` | `~/.claude` | Base directory for all index files |
-| `EXISTENZ_SESSIONS_DIR` | `~/.claude/projects` | Claude Code session files |
+|---|---|---|
+| `EXISTENZ_DATA_DIR` | `~/.claude` | Base directory for index files |
+| `EXISTENZ_SESSIONS_DIR` | `~/.claude/projects` | Claude Code session storage |
 | `EXISTENZ_INDEX_DB` | `~/.claude/session-index.db` | SQLite full-text index |
 | `EXISTENZ_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model |
 
-> Legacy `SSS_*` variables still accepted for backwards compatibility.
+Legacy `SSS_*` variables are still accepted.
 
 ### Embedding models
 
-| Model | Size | Best for |
-|-------|------|----------|
-| `BAAI/bge-small-en-v1.5` | 33 MB | English sessions (default, fastest) |
-| `intfloat/multilingual-e5-small` | 117 MB | **Mixed-language sessions — recommended** |
+| Model | Size | Recommended for |
+|---|---|---|
+| `BAAI/bge-small-en-v1.5` | 33 MB | English-only sessions (default) |
+| `intfloat/multilingual-e5-small` | 117 MB | **Mixed-language sessions** |
 | `BAAI/bge-m3` | 568 MB | Maximum multilingual quality |
 
 ```bash
 EXISTENZ_EMBED_MODEL=intfloat/multilingual-e5-small existenz --index --force
 ```
 
-### Index size
-
-| Sessions | Approx. size |
-|----------|--------------|
-| 100 | ~55 MB |
-| 500 | ~285 MB |
-| 1,000 | ~570 MB |
-
-~0.4 MB per session. See [PRIVACY.md](PRIVACY.md) for managing index size.
+Index size: ~0.4 MB per session (~285 MB at 500 sessions). See [PRIVACY.md](PRIVACY.md).
 
 ---
 
 ## Privacy
 
-All data stays on your machine. Your sessions contain your full conversation history — treat the index like sensitive data: never commit it, never share it.
-
-See [PRIVACY.md](PRIVACY.md) — what the index contains, how to move it to an encrypted volume, how to delete it cleanly.
+All data stays on your machine. Your session index contains your full conversation history — treat it accordingly. See [PRIVACY.md](PRIVACY.md) for what the index contains, how to move it to an encrypted volume, and how to delete it cleanly. The `.gitignore` in this repo excludes all index files by default.
 
 ---
 
 ## Built by
 
-Florian Stangl — built out of necessity after 500+ Claude Code sessions spanning development, SEO, content strategy, and client work. The session history was always there. Getting back to it wasn't.
+Florian Stangl — built out of necessity after 500+ Claude Code sessions across development, SEO, content strategy, and client work. The session history was always there. Getting back to it wasn't.
 
 ---
 
