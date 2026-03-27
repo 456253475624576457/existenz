@@ -1,39 +1,57 @@
-# claude-session-search
+# ExistenZ
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-15%20passed-brightgreen.svg)](tests/)
 
-**Hybrid BM25 + Semantic search over your entire Claude Code conversation history. Fully offline.**
+**Claude Code doesn't remember. ExistenZ does.**
 
-Claude Code stores every conversation locally but gives you no way to search them. This tool indexes everything — and auto-updates after every response via a Stop Hook.
+Every decision you made. Every bug you fixed. Every conversation you had. All of it — searchable, reconstructable, permanent. ExistenZ is persistent memory for Claude Code.
 
 ```
-$ sss "cloudflare deployment failed" --hybrid
+$ existenz "why did we change the deployment config" --hybrid
 
 [HYBRID] 3 results in 0.31s
 
   [1] 2026-03-24  edge-seo-worker  abc1234
-      "wrangler deploy failed — KV key used filename instead of hostname field"
+      "KV key used filename instead of hostname — caused silent deploy failures"
       → read-session abc1234 --last 5
 
   [2] 2026-03-20  cf-proxy-setup   def5678
-      "staging.enabled: true blocked production — fix: set to false before release"
+      "staging.enabled: true blocked production — only discovered after 3 days"
       → read-session def5678 --context
 
-  [3] 2026-03-15  briefadler       ghi9012
-      "wrangler 4.72.0 exit 1 on deploy — resolved by upgrading to 4.77.0"
+  [3] 2026-03-15  infra-review     ghi9012
+      "wrangler 4.72.0 had a known deploy regression — pinned to 4.77.0"
       → read-session ghi9012 --last 3
 ```
+
+---
+
+## The problem
+
+Claude Code is stateless by design. Every session starts fresh. You explain context you've explained before. You rediscover bugs you've already fixed. You lose decisions the moment the conversation ends.
+
+After 500 sessions, you've accumulated thousands of hours of work — and none of it is searchable.
+
+**ExistenZ changes that.**
+
+---
+
+## How it works
+
+ExistenZ hooks into Claude Code's `Stop` event — after every single response, it incrementally indexes the session. Hybrid BM25 + Semantic search across your full history. Everything offline, everything local.
+
+No cloud. No API calls. No data leaving your machine.
 
 ---
 
 ## Features
 
 - **Hybrid search** — BM25 (exact, instant) + Semantic (understands meaning) fused via Reciprocal Rank Fusion
-- **Multilingual** — Handles German/English mixed content; umlauts normalized, CamelCase split
+- **Multilingual** — German/English mixed content, umlauts normalized, CamelCase split
 - **Session fingerprinting** — auto-classifies sessions as deploys, milestones, or by topic
-- **Continuation mode** — `sss --continuation "project"` picks up where you left off
+- **Continuation mode** — `existenz --continuation "project"` picks up exactly where you left off
 - **Conversation reconstruction** — `read-session <id> --last 5` rebuilds exact context to resume work
 - **Zero cloud dependency** — ONNX embeddings, everything local, no API calls
 
@@ -41,13 +59,13 @@ $ sss "cloudflare deployment failed" --hybrid
 
 ## vs. Alternatives
 
-| Feature | this tool | [search-sessions](https://github.com/sinzin91/search-sessions) | [cc-conversation-search](https://github.com/akatz-ai/cc-conversation-search) |
-|---------|-----------|----------------|----------------------|
+| Feature | ExistenZ | [search-sessions](https://github.com/sinzin91/search-sessions) | [cc-conversation-search](https://github.com/akatz-ai/cc-conversation-search) |
+|---------|----------|----------------|----------------------|
 | Hybrid BM25 + Semantic | ✅ | ❌ ripgrep only | ✅ semantic only |
 | Session fingerprinting | ✅ | ❌ | ❌ |
 | Continuation / briefing mode | ✅ | ❌ | ❌ |
 | Multilingual (DE/EN) | ✅ | ❌ | ❌ |
-| Read full session context | ✅ `read-session` | ❌ | ❌ |
+| Full conversation reconstruction | ✅ | ❌ | ❌ |
 | Auto-index via Stop Hook | ✅ | manual | manual |
 | Offline / no API | ✅ | ✅ | ✅ |
 
@@ -64,14 +82,14 @@ $ sss "cloudflare deployment failed" --hybrid
 ## Installation
 
 ```bash
-git clone https://github.com/florianstangl/claude-session-search
-cd claude-session-search
+git clone https://github.com/456253475624576457/existenz
+cd existenz
 bash install.sh
 ```
 
 The installer:
 1. Installs `fastembed` + `numpy` via `uv` (or `pip` as fallback)
-2. Places `sss` in `~/.claude/scripts/`
+2. Places `existenz` in `~/.claude/scripts/`
 3. Places `read-session` in `/usr/local/bin/`
 4. Wires a Stop Hook in `~/.claude/settings.json` — auto-indexes after every response
 5. Builds the initial search index (downloads ~33MB embedding model on first run)
@@ -81,16 +99,6 @@ The installer:
 echo 'export PATH="$HOME/.claude/scripts:$PATH"' >> ~/.zshrc && source ~/.zshrc
 ```
 
-**Upgrade:**
-```bash
-bash install.sh --upgrade
-```
-
-**Remove:**
-```bash
-bash install.sh --uninstall
-```
-
 ---
 
 ## Usage
@@ -98,42 +106,42 @@ bash install.sh --uninstall
 ### Search
 
 ```bash
-sss "cloudflare worker"                    # BM25 — fast, exact
-sss "cloudflare worker" --hybrid           # BM25 + Semantic — best quality
-sss "deployment problems" --semantic       # Semantic only — finds related concepts
-sss "wrangler deploy release" --any        # OR logic — any term matches
-sss "auth" --since 2026-01-01             # Filter by date
-sss "auth" --deployed                      # Only sessions where you ran a deploy
-sss "feature" --milestone                  # Only sessions with a completed milestone
-sss "error" --unique                       # One result per session (deduplicated)
+existenz "cloudflare worker"                   # BM25 — fast, exact
+existenz "cloudflare worker" --hybrid          # BM25 + Semantic — best quality
+existenz "deployment problems" --semantic      # Semantic — finds related concepts
+existenz "wrangler deploy release" --any       # OR logic — any term matches
+existenz "auth" --since 2026-01-01            # Filter by date
+existenz "auth" --deployed                     # Only sessions where you ran a deploy
+existenz "feature" --milestone                 # Only completed milestone sessions
+existenz "error" --unique                      # One result per session
 ```
 
 ### Resume work
 
 ```bash
-sss --continuation "my-project"   # Where was I in the last 48h?
-sss --briefing "my-project"       # Full re-onboarding after a long break
+existenz --continuation "my-project"   # Where was I in the last 48h?
+existenz --briefing "my-project"       # Full re-onboarding after a long break
 ```
 
 ### Reconstruct a conversation
 
 ```bash
 # 1. Find the session
-sss "the bug we fixed last week" --hybrid
+existenz "the bug we fixed last week" --hybrid
 
-# 2. Reconstruct context (pick one)
+# 2. Rebuild context
 read-session abc12345 --last 5      # Last 5 message pairs — exact wording
-read-session abc12345 --context     # Smart summary (~5-8k tokens) — for resuming
+read-session abc12345 --context     # Smart summary — optimized for resuming
 read-session abc12345 --full        # Everything, untruncated
 ```
 
 ### Index management
 
 ```bash
-sss --index              # Incremental update (new sessions only, runs in <2s)
-sss --index --force      # Full rebuild
-sss --stats              # Index statistics
-sss --fingerprint-all    # Classify all sessions (idempotent, safe to re-run)
+existenz --index           # Incremental update (runs in <2s)
+existenz --index --force   # Full rebuild
+existenz --stats           # Index statistics
+existenz --fingerprint-all # Classify all sessions
 ```
 
 ---
@@ -148,7 +156,7 @@ sss --fingerprint-all    # Classify all sessions (idempotent, safe to re-run)
     "Stop": [
       {
         "type": "command",
-        "command": "~/.claude/scripts/sss --index",
+        "command": "~/.claude/scripts/existenz --index",
         "run_in_background": true
       }
     ]
@@ -156,7 +164,7 @@ sss --fingerprint-all    # Classify all sessions (idempotent, safe to re-run)
 }
 ```
 
-The `Stop` event fires after every Claude Code response. The incremental indexer runs in the background and typically completes in under 2 seconds without interrupting your workflow.
+The `Stop` event fires after every Claude Code response. ExistenZ indexes incrementally in the background — typically under 2 seconds, never interrupting your flow.
 
 ---
 
@@ -167,44 +175,43 @@ The `Stop` event fires after every Claude Code response. The incremental indexer
 | `SSS_DATA_DIR` | `~/.claude` | Base directory for all index files |
 | `SSS_SESSIONS_DIR` | `~/.claude/projects` | Where Claude Code stores sessions |
 | `SSS_INDEX_DB` | `~/.claude/session-index.db` | SQLite full-text index |
-| `SSS_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (see below) |
+| `SSS_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model |
 
 ### Embedding model options
 
 | Model | Download | Best for |
 |-------|----------|----------|
-| `BAAI/bge-small-en-v1.5` | 33 MB | English-heavy sessions (default, fast) |
-| `intfloat/multilingual-e5-small` | 117 MB | Mixed German/English (recommended upgrade) |
+| `BAAI/bge-small-en-v1.5` | 33 MB | English-heavy sessions (default) |
+| `intfloat/multilingual-e5-small` | 117 MB | Mixed German/English (recommended) |
 | `BAAI/bge-m3` | 568 MB | Maximum multilingual quality |
 
-Switch model (rebuilds embeddings, one-time):
 ```bash
-SSS_EMBED_MODEL=intfloat/multilingual-e5-small sss --index --force
+SSS_EMBED_MODEL=intfloat/multilingual-e5-small existenz --index --force
 ```
 
 ---
 
 ## Index size
 
-| Sessions | Approx. total size |
-|----------|--------------------|
+| Sessions | Approx. size |
+|----------|--------------|
 | 100 | ~55 MB |
 | 500 | ~285 MB |
 | 1,000 | ~570 MB |
 
-~0.4 MB per session. No automatic pruning. See [PRIVACY.md](PRIVACY.md) for how to manage index size and what the index contains.
+~0.4 MB per session. See [PRIVACY.md](PRIVACY.md) for index management and what to never commit to Git.
 
 ---
 
 ## Privacy
 
-Everything stays on your machine. The index contains your full conversation history. See [PRIVACY.md](PRIVACY.md) — especially the section on what to never commit to Git.
+Everything stays on your machine. See [PRIVACY.md](PRIVACY.md).
 
 ---
 
-## Author
+## Built by
 
-Built by [Florian Stangl](https://github.com/florianstangl) — originally developed as part of a long-running Claude Code workflow spanning 500+ sessions.
+[Florian Stangl](https://github.com/456253475624576457) — built and battle-tested across 500+ Claude Code sessions.
 
 ---
 
