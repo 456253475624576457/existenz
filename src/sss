@@ -30,18 +30,26 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 # --- Konfiguration (alle Pfade via Env-Vars überschreibbar) ---
-_SSS_DATA_DIR = Path(os.environ.get("SSS_DATA_DIR", str(Path.home() / ".claude")))
-SESSIONS_BASE = Path(os.environ.get("SSS_SESSIONS_DIR", str(_SSS_DATA_DIR / "projects")))
-INDEX_DB      = Path(os.environ.get("SSS_INDEX_DB",    str(_SSS_DATA_DIR / "session-index.db")))
-EMBED_NPY     = Path(os.environ.get("SSS_EMBED_NPY",   str(_SSS_DATA_DIR / "session-embeddings.npy")))
-ROWIDS_NPY    = Path(os.environ.get("SSS_ROWIDS_NPY",  str(_SSS_DATA_DIR / "session-rowids.npy")))
-META_PKL      = Path(os.environ.get("SSS_META_PKL",    str(_SSS_DATA_DIR / "session-meta.pkl")))
+# EXISTENZ_* hat Vorrang; SSS_* als Fallback für bestehende Installationen
+def _env(*keys: str, default: str) -> str:
+    for k in keys:
+        if k in os.environ:
+            return os.environ[k]
+    return default
 
-# Embedding-Modell via SSS_EMBED_MODEL überschreibbar:
+_data_dir = _env("EXISTENZ_DATA_DIR", "SSS_DATA_DIR", default=str(Path.home() / ".claude"))
+_SSS_DATA_DIR = Path(_data_dir)
+SESSIONS_BASE = Path(_env("EXISTENZ_SESSIONS_DIR", "SSS_SESSIONS_DIR", default=str(_SSS_DATA_DIR / "projects")))
+INDEX_DB      = Path(_env("EXISTENZ_INDEX_DB",     "SSS_INDEX_DB",     default=str(_SSS_DATA_DIR / "session-index.db")))
+EMBED_NPY     = Path(_env("EXISTENZ_EMBED_NPY",    "SSS_EMBED_NPY",    default=str(_SSS_DATA_DIR / "session-embeddings.npy")))
+ROWIDS_NPY    = Path(_env("EXISTENZ_ROWIDS_NPY",   "SSS_ROWIDS_NPY",   default=str(_SSS_DATA_DIR / "session-rowids.npy")))
+META_PKL      = Path(_env("EXISTENZ_META_PKL",     "SSS_META_PKL",     default=str(_SSS_DATA_DIR / "session-meta.pkl")))
+
+# Embedding-Modell:
 #   "BAAI/bge-small-en-v1.5"         — 33MB,  Englisch-optimiert (Default, schnell)
 #   "BAAI/bge-m3"                     — 568MB, 100+ Sprachen, beste Qualität
 #   "intfloat/multilingual-e5-small"  — 117MB, DE+EN optimiert, guter Kompromiss
-EMBED_MODEL = os.environ.get("SSS_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+EMBED_MODEL = _env("EXISTENZ_EMBED_MODEL", "SSS_EMBED_MODEL", default="BAAI/bge-small-en-v1.5")
 EMBED_DIM   = 384  # gilt für alle drei Modelle oben
 
 

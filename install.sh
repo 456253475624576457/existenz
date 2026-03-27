@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — Smart Session Search (sss) Installer
+# install.sh — ExistenZ Installer
 # Copies scripts, installs dependencies, wires Claude Code Stop Hook.
 #
 # Usage:
@@ -11,7 +11,7 @@ set -euo pipefail
 
 SCRIPTS_DIR="$HOME/.claude/scripts"
 SETTINGS_FILE="$HOME/.claude/settings.json"
-SCRIPT_NAME="sss"
+SCRIPT_NAME="existenz"
 READ_SESSION_DEST="/usr/local/bin/read-session"
 UPGRADE=false
 UNINSTALL=false
@@ -69,7 +69,7 @@ info "Python $PY_VERSION found."
 
 # --- Check existing install ---
 if [ -f "$SCRIPTS_DIR/$SCRIPT_NAME" ] && ! $UPGRADE; then
-  warn "sss already installed at $SCRIPTS_DIR/$SCRIPT_NAME"
+  warn "ExistenZ already installed at $SCRIPTS_DIR/$SCRIPT_NAME"
   warn "Run with --upgrade to overwrite."
   exit 0
 fi

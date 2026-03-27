@@ -9,20 +9,20 @@
 Every decision you made. Every bug you fixed. Every conversation you had. All of it — searchable, reconstructable, permanent. ExistenZ is persistent memory for Claude Code.
 
 ```
-$ existenz "why did we change the deployment config" --hybrid
+$ existenz "why did the auth middleware break" --hybrid
 
 [HYBRID] 3 results in 0.31s
 
-  [1] 2026-03-24  edge-seo-worker  abc1234
-      "KV key used filename instead of hostname — caused silent deploy failures"
+  [1] 2026-03-24  backend-api     abc1234
+      "session tokens stored in plaintext — switched to signed JWT, broke old cookies"
       → read-session abc1234 --last 5
 
-  [2] 2026-03-20  cf-proxy-setup   def5678
-      "staging.enabled: true blocked production — only discovered after 3 days"
+  [2] 2026-03-18  user-service    def5678
+      "middleware order matters — auth must run before rate limiter or 401s cascade"
       → read-session def5678 --context
 
-  [3] 2026-03-15  infra-review     ghi9012
-      "wrangler 4.72.0 had a known deploy regression — pinned to 4.77.0"
+  [3] 2026-02-09  infra-review    ghi9012
+      "nginx config silently dropped Authorization header — took 2 days to find"
       → read-session ghi9012 --last 3
 ```
 
@@ -106,10 +106,10 @@ echo 'export PATH="$HOME/.claude/scripts:$PATH"' >> ~/.zshrc && source ~/.zshrc
 ### Search
 
 ```bash
-existenz "cloudflare worker"                   # BM25 — fast, exact
-existenz "cloudflare worker" --hybrid          # BM25 + Semantic — best quality
-existenz "deployment problems" --semantic      # Semantic — finds related concepts
-existenz "wrangler deploy release" --any       # OR logic — any term matches
+existenz "database migration failed"           # BM25 — fast, exact
+existenz "database migration" --hybrid         # BM25 + Semantic — best quality
+existenz "performance problems" --semantic     # Semantic — finds related concepts
+existenz "deploy release publish" --any        # OR logic — any term matches
 existenz "auth" --since 2026-01-01            # Filter by date
 existenz "auth" --deployed                     # Only sessions where you ran a deploy
 existenz "feature" --milestone                 # Only completed milestone sessions
@@ -172,10 +172,12 @@ The `Stop` event fires after every Claude Code response. ExistenZ indexes increm
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SSS_DATA_DIR` | `~/.claude` | Base directory for all index files |
-| `SSS_SESSIONS_DIR` | `~/.claude/projects` | Where Claude Code stores sessions |
-| `SSS_INDEX_DB` | `~/.claude/session-index.db` | SQLite full-text index |
-| `SSS_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model |
+| `EXISTENZ_DATA_DIR` | `~/.claude` | Base directory for all index files |
+| `EXISTENZ_SESSIONS_DIR` | `~/.claude/projects` | Where Claude Code stores sessions |
+| `EXISTENZ_INDEX_DB` | `~/.claude/session-index.db` | SQLite full-text index |
+| `EXISTENZ_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model |
+
+Legacy `SSS_*` variables are still accepted for backwards compatibility.
 
 ### Embedding model options
 
@@ -186,7 +188,7 @@ The `Stop` event fires after every Claude Code response. ExistenZ indexes increm
 | `BAAI/bge-m3` | 568 MB | Maximum multilingual quality |
 
 ```bash
-SSS_EMBED_MODEL=intfloat/multilingual-e5-small existenz --index --force
+EXISTENZ_EMBED_MODEL=intfloat/multilingual-e5-small existenz --index --force
 ```
 
 ---
@@ -211,7 +213,7 @@ Everything stays on your machine. See [PRIVACY.md](PRIVACY.md).
 
 ## Built by
 
-[Florian Stangl](https://github.com/456253475624576457) — built and battle-tested across 500+ Claude Code sessions.
+Florian Stangl — built and battle-tested across 500+ Claude Code sessions.
 
 ---
 
