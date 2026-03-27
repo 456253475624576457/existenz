@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""
+read-session — Extrahiert lesbare Messages aus einer Claude Code Session.
+
+Usage:
+  read-session <session-id>                    # Letzte 30 User-Messages (kompakt)
+  read-session <session-id> --all              # User + Assistant Messages
+  read-session <session-id> --limit N          # Nur N Messages
+  read-session <session-id> --last             # Letzte KI-Antwort vollständig
+  read-session <session-id> --last N           # Letzte N Nachrichten-Paare (ungekürzt)
+  read-session <session-id> --context          # Smart-Kontext zum Anknüpfen (~5-8K Tokens)
+  read-session <session-id> --full             # Alles ungekürzt (Vorsicht: kann riesig sein)
+  read-session <session-id> --summary          # Nur Session-Summaries (Kontext-Komprimierungen)
+
+Flags:
+  --no-truncate    Keine Zeichenlimit-Kürzung (default: 400 User / 300 Asst)
+  --tokens         Zeigt geschätzte Token-Zahl am Ende
+
+Output: kompakt, token-effizient — zeigt WAS besprochen wurde.
+"""
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Optional
+
+PROJECTS_BASE = Path.home() / ".claude" / "projects"
+
+# Patterns für system-injizierte Blöcke in User-Messages
+_SYSTEM_BLOCK_RE = re.compile(
+    r'<(?:system-reminder|task-notification|antml:function_calls|antml:invoke)'
+    r'[\s\S]*?</(?:system-reminder|task-notification|antml:function_calls|antml:invoke)>',
+    re.IGNORECASE,
+)
+_HOOK_HEADER_RE = re.compile(
+    r'^\[(?:Session-Historie|HERMES\s*→\s*CLAUDE)[^\]]*\].*?(?=\n\n|\Z)',
+    re.DOTALL | re.MULTILINE,
+)
+_IDE_TAG_RE = re.compile(
+    r'<ide_(?:opened_file|selection)>(.*?)</ide_(?:opened_file|selection)>',
+    re.DOTALL,
+)
+
+
+def _clean_text(text: str, keep_full: bool = False) -> str:
+    """Entfernt system-injizierte XML-Blöcke und Hook-Output."""
+    text = _SYSTEM_BLOCK_RE.sub('', text)
+    text = _HOOK_HEADER_RE.sub('', text)
+    if not keep_full:
+        # Kompaktiere IDE-Tags zu einzeiligen Hinweisen
+        def _ide_repl(m):
+            inner = m.group(1).strip()
+            # Nur Dateiname extrahieren
+            if 'opened the file' in inner:
+                match = re.search(r'/([^/]+)$', inner.split(' in the IDE')[0])
+                if match:
+                    return f'[IDE: {match.group(1)}]'
+            return f'[IDE: {inner[:100]}]'
+        text = _IDE_TAG_RE.sub(_ide_repl, text)
+    return text.strip()
+
+
+def find_session_file(session_id: str) -> Optional[Path]:
+    """Sucht JSONL-Datei für Session-ID quer durch alle Projekte."""
+    for proj_dir in PROJECTS_BASE.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        candidate = proj_dir / f"{session_id}.jsonl"
+        if candidate.exists():
+            return candidate
+
+    # Partial match (8-char prefix)
+    if len(session_id) < 36:
+        for proj_dir in PROJECTS_BASE.iterdir():
+            if not proj_dir.is_dir():
+                continue
+            for f in proj_dir.glob(f"{session_id}*.jsonl"):
+                return f
+
+    return None
+
+
+def extract_all_messages(path: Path) -> list:
+    """Liest JSONL und extrahiert ALLE Messages (User + Assistant + Summaries)."""
+    messages = []
+
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            msg_type = obj.get("type")
+            timestamp = obj.get("timestamp", "")
+
+            # Summary blocks (context compressions by Claude Code)
+            if msg_type == "summary":
+                summary_text = obj.get("summary", "")
+                if summary_text:
+                    messages.append({
+                        "role": "SUMMARY",
+                        "ts": timestamp[:16],
+                        "text": summary_text,
+                    })
+                continue
+
+            # Human messages
+            if msg_type == "user":
+                # Skip internal/tool messages
+                if obj.get("userType") not in ("external", None):
+                    continue
+                content = obj.get("message", {}).get("content", "")
+                text = _extract_text(content)
+                if text:
+                    messages.append({
+                        "role": "USER",
+                        "ts": timestamp[:16],
+                        "text": text,
+                    })
+
+            # Assistant messages
+            elif msg_type == "assistant":
+                msg = obj.get("message", {})
+                content = msg.get("content", []) if isinstance(msg, dict) else []
+                text = _extract_text(content)
+                if text:
+                    messages.append({
+                        "role": "ASST",
+                        "ts": timestamp[:16],
+                        "text": text,
+                    })
+
+    return messages
+
+
+def _extract_text(content) -> str:
+    """Extrahiert Text aus verschiedenen Content-Formaten."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        texts = []
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                t = c.get("text", "").strip()
+                if t and not t.startswith('<system-reminder>'):
+                    texts.append(t)
+        return "\n\n".join(texts)
+    return ""
+
+
+def _truncate(text: str, max_len: int) -> str:
+    if max_len <= 0 or len(text) <= max_len:
+        return text
+    return text[:max_len] + f"\n[... +{len(text) - max_len} Zeichen]"
+
+
+def _estimate_tokens(text: str) -> int:
+    """Grobe Token-Schätzung (1 Token ≈ 4 Zeichen für Deutsch)."""
+    return len(text) // 4
+
+
+def format_message(m: dict, truncate_user: int = 400, truncate_asst: int = 300) -> str:
+    """Formatiert eine einzelne Nachricht."""
+    role = m["role"]
+    ts = m["ts"]
+    text = _clean_text(m["text"], keep_full=(truncate_user <= 0))
+
+    if truncate_user > 0 and role == "USER":
+        text = _truncate(text, truncate_user)
+    elif truncate_asst > 0 and role == "ASST":
+        text = _truncate(text, truncate_asst)
+
+    # Einzeilig für kompakte Darstellung
+    if truncate_user > 0 or truncate_asst > 0:
+        text = text.replace("\n", " ").strip()
+        return f"  {role} {ts}: {text}"
+    else:
+        # Mehrzeilig für vollständige Darstellung
+        return f"\n{'='*60}\n[{role}] {ts}\n{'='*60}\n{text}"
+
+
+# ─── Modi ───────────────────────────────────────────────────
+
+
+def mode_default(messages: list, limit: int = 30) -> list:
+    """Standard: Letzte N User-Messages (kompakt)."""
+    user_msgs = [m for m in messages if m["role"] == "USER"]
+    return user_msgs[-limit:]
+
+
+def mode_all(messages: list, limit: int = 30) -> list:
+    """Alle Rollen, letzte N Messages."""
+    relevant = [m for m in messages if m["role"] in ("USER", "ASST")]
+    return relevant[-limit:]
+
+
+def mode_last(messages: list, n: int = 1) -> list:
+    """Letzte N Nachrichten-Paare (User+Asst) oder nur letzte KI-Antwort."""
+    if n == 1:
+        # Nur die allerletzte Assistant-Nachricht
+        for m in reversed(messages):
+            if m["role"] == "ASST":
+                return [m]
+        return []
+    else:
+        # Letzte N Paare: von hinten N User-Messages + ihre Antworten
+        relevant = [m for m in messages if m["role"] in ("USER", "ASST")]
+        # Finde die letzten N User-Messages und alles dazwischen
+        pairs = []
+        user_count = 0
+        for m in reversed(relevant):
+            pairs.append(m)
+            if m["role"] == "USER":
+                user_count += 1
+                if user_count >= n:
+                    break
+        pairs.reverse()
+        return pairs
+
+
+def mode_context(messages: list) -> list:
+    """Smart-Kontext zum Anknüpfen: Summary + letzte 5 Paare.
+
+    Zielbudget: ~5-8K Tokens (~20-32K Zeichen)
+    Strategie:
+    1. Letzte Summary (falls vorhanden) = Überblick über ältere Teile
+    2. Letzte 5 User-Nachrichten + KI-Antworten = konkreter Arbeitsstand
+    """
+    result = []
+
+    # 1. Letzte Summary finden
+    summaries = [m for m in messages if m["role"] == "SUMMARY"]
+    if summaries:
+        last_summary = summaries[-1]
+        # Summary auf ~8K Zeichen kürzen (= ~2K Tokens)
+        result.append({
+            "role": "SUMMARY",
+            "ts": last_summary["ts"],
+            "text": _truncate(last_summary["text"], 8000),
+        })
+
+    # 2. Letzte 5 Paare (ungekürzt, aber KI-Antworten auf 3K Zeichen)
+    relevant = [m for m in messages if m["role"] in ("USER", "ASST")]
+    pairs = []
+    user_count = 0
+    for m in reversed(relevant):
+        pairs.append(m)
+        if m["role"] == "USER":
+            user_count += 1
+            if user_count >= 5:
+                break
+    pairs.reverse()
+
+    for m in pairs:
+        entry = dict(m)
+        if entry["role"] == "ASST":
+            entry["text"] = _truncate(entry["text"], 3000)
+        result.append(entry)
+
+    return result
+
+
+def mode_summary(messages: list) -> list:
+    """Nur Summaries (Kontext-Komprimierungen)."""
+    return [m for m in messages if m["role"] == "SUMMARY"]
+
+
+def mode_full(messages: list) -> list:
+    """Alles, ungekürzt."""
+    return [m for m in messages if m["role"] in ("USER", "ASST", "SUMMARY")]
+
+
+# ─── Main ───────────────────────────────────────────────────
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        sys.exit(0)
+
+    session_id = args[0]
+    show_tokens = "--tokens" in args
+    no_truncate = "--no-truncate" in args
+
+    path = find_session_file(session_id)
+    if not path:
+        print(f"Session nicht gefunden: {session_id}")
+        print(f"Gesucht in: {PROJECTS_BASE}")
+        sys.exit(1)
+
+    # Alle Messages einmal laden
+    all_messages = extract_all_messages(path)
+
+    # Modus bestimmen
+    if "--context" in args:
+        selected = mode_context(all_messages)
+        truncate_user = 0  # ungekürzt
+        truncate_asst = 3000
+    elif "--last" in args:
+        idx = args.index("--last")
+        n = 1
+        if idx + 1 < len(args) and args[idx + 1].isdigit():
+            n = int(args[idx + 1])
+        selected = mode_last(all_messages, n)
+        truncate_user = 0
+        truncate_asst = 0  # vollständig
+    elif "--full" in args:
+        selected = mode_full(all_messages)
+        truncate_user = 0
+        truncate_asst = 0
+    elif "--summary" in args:
+        selected = mode_summary(all_messages)
+        truncate_user = 0
+        truncate_asst = 0
+    elif "--all" in args:
+        limit = 30
+        if "--limit" in args:
+            idx = args.index("--limit")
+            if idx + 1 < len(args):
+                limit = int(args[idx + 1])
+        selected = mode_all(all_messages, limit)
+        truncate_user = 400 if not no_truncate else 0
+        truncate_asst = 300 if not no_truncate else 0
+    else:
+        limit = 30
+        if "--limit" in args:
+            idx = args.index("--limit")
+            if idx + 1 < len(args):
+                limit = int(args[idx + 1])
+        selected = mode_default(all_messages, limit)
+        truncate_user = 400 if not no_truncate else 0
+        truncate_asst = 300
+
+    if no_truncate:
+        truncate_user = 0
+        truncate_asst = 0
+
+    # Output
+    lines = [f"[Session: {session_id}]"]
+    total_chars = 0
+
+    for m in selected:
+        formatted = format_message(m, truncate_user, truncate_asst)
+        lines.append(formatted)
+        total_chars += len(m["text"])
+
+    output = "\n".join(lines)
+    print(output)
+
+    # Footer
+    role_counts = {}
+    for m in selected:
+        role_counts[m["role"]] = role_counts.get(m["role"], 0) + 1
+    count_str = ", ".join(f"{v} {k}" for k, v in role_counts.items())
+    print(f"\n[{count_str} | {path.name}]")
+
+    if show_tokens:
+        est = _estimate_tokens(output)
+        print(f"[~{est:,} Tokens geschätzt | {len(output):,} Zeichen]")
+
+
+if __name__ == "__main__":
+    main()

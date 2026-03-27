@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.uv/
+
+# Index data — NEVER commit (contains your full conversation history)
+session-index.db
+session-embeddings.npy
+session-rowids.npy
+session-meta.pkl
+*.db
+*.npy
+*.pkl
+
+# Claude Code session files — NEVER commit
+projects/
+*.jsonl
+
+# Environment
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.cursor/
+*.swp

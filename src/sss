@@ -1,0 +1,1710 @@
+#!/usr/bin/env python3
+"""
+sss — Smart Session Search
+Hybrid BM25 (SQLite FTS5) + Semantic (fastembed) über Claude Code Sessions.
+
+Usage:
+  sss "Erklärvideo"                     # BM25 (schnell, default)
+  sss "Erklärvideo" --semantic          # Semantic (pre-computed embeddings, ~0.4s)
+  sss "Erklärvideo" --hybrid            # BM25 + Semantic kombiniert (beste Qualität)
+  sss "V15" --project "SEO BASE"        # Projekt-Filter
+  sss "V15" --role user                 # Nur User-Turns
+  sss "V15" --since 2026-03-20          # Ab Datum
+  sss "V15" --limit 5                   # Max N Ergebnisse
+  sss "deploy" --deployed               # Nur Sessions mit Deploy-Befehl
+  sss "wrangler" --milestone            # Nur Sessions mit Go-Live/Abschluss
+  sss --index                           # FTS5 + Embeddings aufbauen/aktualisieren
+  sss --index --force                   # Komplett neu aufbauen
+  sss --fingerprint-all                 # Alle Sessions klassifizieren (Batch)
+  sss --stats                           # Index-Statistiken
+"""
+
+import sqlite3
+import json
+import os
+import sys
+import re
+import time
+import argparse
+from pathlib import Path
+from datetime import datetime, timedelta
+
+# --- Konfiguration (alle Pfade via Env-Vars überschreibbar) ---
+_SSS_DATA_DIR = Path(os.environ.get("SSS_DATA_DIR", str(Path.home() / ".claude")))
+SESSIONS_BASE = Path(os.environ.get("SSS_SESSIONS_DIR", str(_SSS_DATA_DIR / "projects")))
+INDEX_DB      = Path(os.environ.get("SSS_INDEX_DB",    str(_SSS_DATA_DIR / "session-index.db")))
+EMBED_NPY     = Path(os.environ.get("SSS_EMBED_NPY",   str(_SSS_DATA_DIR / "session-embeddings.npy")))
+ROWIDS_NPY    = Path(os.environ.get("SSS_ROWIDS_NPY",  str(_SSS_DATA_DIR / "session-rowids.npy")))
+META_PKL      = Path(os.environ.get("SSS_META_PKL",    str(_SSS_DATA_DIR / "session-meta.pkl")))
+
+# Embedding-Modell via SSS_EMBED_MODEL überschreibbar:
+#   "BAAI/bge-small-en-v1.5"         — 33MB,  Englisch-optimiert (Default, schnell)
+#   "BAAI/bge-m3"                     — 568MB, 100+ Sprachen, beste Qualität
+#   "intfloat/multilingual-e5-small"  — 117MB, DE+EN optimiert, guter Kompromiss
+EMBED_MODEL = os.environ.get("SSS_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+EMBED_DIM   = 384  # gilt für alle drei Modelle oben
+
+
+# --- Text-Normalisierung (German + CamelCase) ---
+def normalize(text: str) -> str:
+    """
+    German-aware preprocessing für besseres FTS-Matching.
+    'ErklaervideoV14' → 'erklaervideo v 14'
+    'Erklärvideo'     → 'erklarervideo'  (matcht obiges)
+    """
+    if not text:
+        return ""
+    # Umlaute
+    for a, b in [('ä','ae'),('ö','oe'),('ü','ue'),('Ä','Ae'),('Ö','Oe'),('Ü','Ue'),('ß','ss')]:
+        text = text.replace(a, b)
+    # camelCase aufbrechen: ErklaervideoV14 → Erklaervideo V14
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+    # Buchstaben-Zahlen trennen: V14 → V 14, S08 → S 08
+    text = re.sub(r'([A-Za-z])(\d+)', r'\1 \2', text)
+    return text.lower()
+
+
+def extract_text_from_message(msg: dict, include_tool_inputs: bool = True) -> str:
+    """Extrahiert lesbaren Text aus einer Message-Struktur."""
+    parts = []
+    content = msg.get("content", "")
+
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+            if btype == "text":
+                parts.append(block.get("text", ""))
+            elif btype == "tool_use" and include_tool_inputs:
+                inp = block.get("input", {})
+                for k, v in inp.items():
+                    if isinstance(v, str) and 5 < len(v) < 3000:
+                        parts.append(v)
+            elif btype == "tool_result":
+                for sub in block.get("content", []):
+                    if isinstance(sub, dict) and sub.get("type") == "text":
+                        parts.append(sub.get("text", "")[:2000])
+
+    return " ".join(parts).strip()
+
+
+def extract_turns(jsonl_path: Path) -> list[dict]:
+    """Extrahiert alle nutzbaren Turns aus einer JSONL-Session-Datei."""
+    turns = []
+    session_id = jsonl_path.stem
+    project = jsonl_path.parent.name
+
+    try:
+        with open(jsonl_path, errors="replace") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                    t = obj.get("type", "")
+                    if t not in ("user", "assistant"):
+                        continue
+
+                    ts = obj.get("timestamp", "")[:19]
+                    msg = obj.get("message", {})
+                    text = extract_text_from_message(msg)
+
+                    if not text or len(text) < 15:
+                        continue
+
+                    turns.append({
+                        "session_id": session_id,
+                        "project": project,
+                        "timestamp": ts,
+                        "role": t,
+                        "text": text[:8000],       # Display-Text (original)
+                        "normalized": normalize(text[:8000]),  # FTS-Index-Text
+                    })
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return turns
+
+
+# --- Session-Fingerprinting ---
+
+# Wörter die auf ein erfolgreich abgeschlossenes Milestone-Event hinweisen
+_MILESTONE_PATTERNS = [
+    r'\bgo.?live\b',
+    r'\blive gegangen\b',
+    r'\bdeployed?\b',
+    r'\brelease\b',
+    r'\babgeschlossen\b',
+    r'\bfertig gestellt\b',
+    r'\berfolgreich\b.*\bpush\b',
+    r'\bpush.*\berfolgreich\b',
+    r'\bergebnis.*\bfertig\b',
+    r'\bscore.*\b(100|9[5-9])\b',
+    r'\bpubliziert\b',
+    r'\bveröffentlicht\b',
+]
+
+# Wörter die auf einen Deploy-Befehl hinweisen
+_DEPLOY_PATTERNS = [
+    r'\bwrangler\b',
+    r'\bmake release\b',
+    r'\bmake deploy\b',
+    r'\bpush-config\b',
+    r'\bpush-briefadler\b',
+    r'\bpush-tkh\b',
+    r'\bnpm run deploy\b',
+    r'\bwrangler deploy\b',
+    r'\bwrangler publish\b',
+    r'\bcf.?deploy\b',
+]
+
+# Themen-Keywords → Cluster-Labels
+_TOPIC_KEYWORDS: list[tuple[str, list[str]]] = [
+    ("cloudflare",  ["cloudflare", "wrangler", "worker", "kv store", "edge seo", "cf proxy"]),
+    ("briefadler",  ["briefadler", "brief adler", "outreach", "lead"]),
+    ("tiroler",     ["tiroler", "kraeuterhof", "tee", "naturshampoo", "jtl"]),
+    ("remotion",    ["remotion", "erklaervideo", "composition", "animation"]),
+    ("facharzt",    ["facharzt", "psychiater", "dornbirn", "lenkeignung"]),
+    ("bier-genuss", ["bier genuss", "bier-genuss", "berlin"]),
+    ("seo",         ["sistrix", "sichtbarkeit", "ranking", "keyword", "serp"]),
+    ("autonomous",  ["janitor", "autonomous", "cron", "launchagent", "sleep"]),
+    ("csv",         ["csv", "jtl", "meta daten", "produkttext"]),
+    ("preview",     ["preview engine", "kv push", "deploy briefadler"]),
+    ("content",     ["artikel", "content factory", "blog", "text generierung"]),
+    ("nanobot",     ["nanobot", "bridge", "gateway", "minimax"]),
+]
+
+_MILESTONE_RES = [re.compile(p, re.IGNORECASE) for p in _MILESTONE_PATTERNS]
+_DEPLOY_RES    = [re.compile(p, re.IGNORECASE) for p in _DEPLOY_PATTERNS]
+
+
+def fingerprint_session(turns: list[dict]) -> tuple[str, int, int]:
+    """
+    Klassifiziert eine Session anhand der letzten 20 Turns (oder aller wenn <20).
+
+    Gibt zurück: (topics_json, milestone_detected, deploy_detected)
+    topics_json = JSON-Array mit bis zu 5 Themen-Labels, z.B. '["cloudflare","seo"]'
+    milestone_detected = 1 wenn mind. 1 Milestone-Pattern gefunden
+    deploy_detected    = 1 wenn mind. 1 Deploy-Pattern gefunden
+    """
+    # Nur die letzten 20 Turns analysieren (effizienter, fokussierter)
+    recent_turns = turns[-20:] if len(turns) > 20 else turns
+    combined_text = " ".join(t.get("text", "") for t in recent_turns).lower()
+
+    # Milestone prüfen: Pattern + Mindest-Turn-Schwelle (< 10 = Headless-Deploy, kein Milestone)
+    pattern_hit = any(rx.search(combined_text) for rx in _MILESTONE_RES)
+    milestone = int(pattern_hit and len(turns) >= 10)
+
+    # Deploy prüfen
+    deployed = int(any(rx.search(combined_text) for rx in _DEPLOY_RES))
+
+    # Themen extrahieren (alle Turns, nicht nur letzte 20 — für bessere Abdeckung)
+    all_text = " ".join(t.get("text", "") for t in turns).lower()
+    found_topics = []
+    for label, keywords in _TOPIC_KEYWORDS:
+        if any(kw in all_text for kw in keywords):
+            found_topics.append(label)
+
+    topics_json = json.dumps(found_topics[:5], ensure_ascii=False)
+    return topics_json, milestone, deployed
+
+
+def fingerprint_all(verbose: bool = True) -> int:
+    """
+    Batch-Fingerprinting für alle bestehenden Sessions in der DB.
+
+    Liest JSONL-Dateien, berechnet Fingerprint, schreibt in sessions_meta.
+    Überspringt Sessions die bereits fingerprinted sind (topics IS NOT NULL).
+    Gibt Anzahl neu fingerprinted Sessions zurück.
+    """
+    conn = get_db()
+
+    # Sessions die noch kein Fingerprint haben
+    unfingered = {row[0] for row in conn.execute(
+        "SELECT session_id FROM sessions_meta WHERE topics IS NULL"
+    )}
+
+    if not unfingered:
+        if verbose:
+            print("Alle Sessions bereits fingerprinted.")
+        return 0
+
+    if verbose:
+        print(f"Fingerprinting: {len(unfingered)} Sessions ohne Klassifizierung...")
+
+    # JSONL-Dateien finden
+    jsonl_map: dict[str, Path] = {}
+    for item in SESSIONS_BASE.iterdir():
+        if item.is_dir():
+            for f in item.glob("*.jsonl"):
+                if f.stem in unfingered:
+                    jsonl_map[f.stem] = f
+        elif item.suffix == ".jsonl" and item.stem in unfingered:
+            jsonl_map[item.stem] = item
+
+    done = 0
+    for i, (sid, jsonl_path) in enumerate(jsonl_map.items()):
+        turns = extract_turns(jsonl_path)
+        if not turns:
+            # Session ohne Turns: leere Defaults setzen
+            conn.execute(
+                "UPDATE sessions_meta SET topics=?, milestone_detected=?, deploy_detected=? WHERE session_id=?",
+                ('[]', 0, 0, sid)
+            )
+            done += 1
+            continue
+
+        topics_json, milestone, deployed = fingerprint_session(turns)
+        conn.execute(
+            "UPDATE sessions_meta SET topics=?, milestone_detected=?, deploy_detected=? WHERE session_id=?",
+            (topics_json, milestone, deployed, sid)
+        )
+        done += 1
+
+        if (i + 1) % 50 == 0:
+            conn.commit()
+            if verbose:
+                print(f"  {i+1}/{len(jsonl_map)} Sessions fingerprinted...")
+
+    conn.commit()
+
+    # active_minutes rückwirkend für alle Sessions ohne Wert berechnen
+    missing_time = conn.execute(
+        "SELECT session_id, first_ts, last_ts, turn_count FROM sessions_meta WHERE active_minutes IS NULL"
+    ).fetchall()
+    if missing_time:
+        if verbose:
+            print(f"Berechne active_minutes für {len(missing_time)} Sessions...")
+        for sid, first_ts_str, last_ts_str, turn_count in missing_time:
+            calendar_minutes = 0
+            if first_ts_str and last_ts_str and first_ts_str != last_ts_str:
+                try:
+                    t_first = datetime.fromisoformat(first_ts_str)
+                    t_last  = datetime.fromisoformat(last_ts_str)
+                    calendar_minutes = (t_last - t_first).total_seconds() / 60
+                except Exception:
+                    calendar_minutes = 0
+            active_minutes = int(min((turn_count or 0) * 3, calendar_minutes))
+            conn.execute(
+                "UPDATE sessions_meta SET active_minutes=? WHERE session_id=?",
+                (active_minutes, sid)
+            )
+        conn.commit()
+
+    if verbose:
+        # Zusammenfassung
+        totals = conn.execute(
+            "SELECT COUNT(*), SUM(milestone_detected), SUM(deploy_detected) FROM sessions_meta"
+        ).fetchone()
+        print(f"Fertig: {done} neu fingerprinted | "
+              f"Milestones gesamt: {totals[1]} | Deploys gesamt: {totals[2]}")
+
+    return done
+
+
+# --- Datenbank ---
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(INDEX_DB)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA cache_size=-32768")  # 32MB page cache
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sessions_meta (
+            session_id TEXT PRIMARY KEY,
+            project TEXT,
+            first_ts TEXT,
+            last_ts TEXT,
+            turn_count INTEGER,
+            indexed_at TEXT,
+            embedded_at TEXT DEFAULT NULL
+        )
+    """)
+
+    # FTS5: content = normalisierter Text (wird durchsucht)
+    # alle anderen Felder UNINDEXED = nur gespeichert, nicht durchsucht
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
+            session_id UNINDEXED,
+            project UNINDEXED,
+            timestamp UNINDEXED,
+            role UNINDEXED,
+            text UNINDEXED,
+            content,
+            tokenize='unicode61 remove_diacritics 2'
+        )
+    """)
+
+    # turns_vec: rowid PRIMARY KEY = FTS5 rowid (monoton, 1:1-Mapping)
+    # embedding BLOB = float32 array (EMBED_DIM * 4 bytes pro Row)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS turns_vec (
+            rowid INTEGER PRIMARY KEY,
+            embedding BLOB
+        )
+    """)
+
+    # Schema-Migration: Spalten zu bestehenden DBs hinzufügen (idempotent)
+    migrations = [
+        "ALTER TABLE sessions_meta ADD COLUMN embedded_at TEXT DEFAULT NULL",
+        "ALTER TABLE sessions_meta ADD COLUMN topics TEXT DEFAULT NULL",
+        "ALTER TABLE sessions_meta ADD COLUMN milestone_detected INTEGER DEFAULT 0",
+        "ALTER TABLE sessions_meta ADD COLUMN deploy_detected INTEGER DEFAULT 0",
+        "ALTER TABLE sessions_meta ADD COLUMN active_minutes INTEGER DEFAULT NULL",
+    ]
+    for sql in migrations:
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass  # Spalte existiert bereits
+
+    conn.commit()
+    return conn
+
+
+# --- Embedding-Modell ---
+_embed_model = None
+
+def get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        try:
+            from fastembed import TextEmbedding
+            _embed_model = TextEmbedding(EMBED_MODEL)
+        except Exception as e:
+            print(f"Embedding-Modell nicht verfügbar: {e}", file=sys.stderr)
+            return None
+    return _embed_model
+
+
+# --- Index aufbauen ---
+def build_index(force: bool = False, project_filter: str = None, verbose: bool = True):
+    """
+    Baut FTS5-Index + Embeddings auf (inkrementell).
+
+    Phase 1: Neue Sessions → FTS5 + Embeddings
+    Phase 2: Bestehende Sessions ohne Embeddings nachholen (Einmal-Migration)
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        print("numpy fehlt: pip3 install numpy --break-system-packages", file=sys.stderr)
+        return 0
+
+    conn = get_db()
+    t0 = time.time()
+
+    # Alle JSONL-Dateien finden
+    jsonl_files = []
+    for item in SESSIONS_BASE.iterdir():
+        if item.is_dir():
+            jsonl_files.extend(item.glob("*.jsonl"))
+        elif item.suffix == ".jsonl":
+            jsonl_files.append(item)
+
+    if project_filter:
+        jsonl_files = [f for f in jsonl_files if project_filter.lower() in str(f.parent).lower()]
+
+    if not force:
+        indexed = {row[0] for row in conn.execute("SELECT session_id FROM sessions_meta")}
+        new_files = [f for f in jsonl_files if f.stem not in indexed]
+    else:
+        conn.execute("DELETE FROM turns_fts")
+        conn.execute("DELETE FROM turns_vec")
+        conn.execute("DELETE FROM sessions_meta")
+        conn.commit()
+        new_files = jsonl_files
+
+    if verbose:
+        already = len(jsonl_files) - len(new_files)
+        print(f"Index-Update: {len(new_files)} neue Sessions (bereits: {already})")
+
+    # Embedding-Modell vorladen (cached nach erstem Aufruf)
+    embed_model = None
+    try:
+        from fastembed import TextEmbedding
+        embed_model = TextEmbedding(EMBED_MODEL)
+    except Exception as e:
+        if verbose and new_files:
+            print(f"  Embedding nicht verfügbar — nur BM25: {e}", file=sys.stderr)
+
+    # === Phase 1: Neue Sessions (FTS5 + Embeddings) ===
+    inserted_turns = 0
+    for i, jsonl_path in enumerate(new_files):
+        turns = extract_turns(jsonl_path)
+        if not turns:
+            continue
+
+        session_id = turns[0]["session_id"]
+
+        # FTS5 einlesen
+        conn.executemany(
+            "INSERT INTO turns_fts(session_id, project, timestamp, role, text, content) VALUES (?,?,?,?,?,?)",
+            [(t["session_id"], t["project"], t["timestamp"], t["role"],
+              t["text"], t["normalized"]) for t in turns]
+        )
+
+        # Rowids der eben eingefügten Turns (FTS5 rowids sind monoton steigend)
+        max_row = conn.execute("SELECT MAX(rowid) FROM turns_fts").fetchone()
+        if max_row and max_row[0] is not None:
+            max_rowid = max_row[0]
+            rowids = list(range(max_rowid - len(turns) + 1, max_rowid + 1))
+
+            # Embeddings für diese Session (in Batches)
+            if embed_model is not None:
+                texts = [t["text"][:128] for t in turns]  # 128 chars reicht für Semantik, 3x schneller
+                batch_size = 64  # kleinere Batches = weniger peak memory
+                all_blobs = []
+                for bi in range(0, len(texts), batch_size):
+                    vecs = list(embed_model.embed(texts[bi:bi+batch_size]))
+                    for vec in vecs:
+                        all_blobs.append(np.array(vec, dtype=np.float32).tobytes())
+                conn.executemany(
+                    "INSERT OR REPLACE INTO turns_vec(rowid, embedding) VALUES (?, ?)",
+                    [(rowids[j], all_blobs[j]) for j in range(len(rowids))]
+                )
+
+        # Sessions-Meta + Fingerprinting
+        timestamps = [t["timestamp"] for t in turns if t["timestamp"]]
+        now_iso = datetime.now().isoformat()
+        topics_json, milestone, deployed = fingerprint_session(turns)
+
+        # active_minutes: realistischerer Schätzwert als Kalenderzeit
+        # max 3 Minuten pro Turn, gedeckelt durch tatsächliche Kalenderzeit
+        first_ts_str = min(timestamps, default="")
+        last_ts_str  = max(timestamps, default="")
+        calendar_minutes = 0
+        if first_ts_str and last_ts_str and first_ts_str != last_ts_str:
+            try:
+                t_first = datetime.fromisoformat(first_ts_str)
+                t_last  = datetime.fromisoformat(last_ts_str)
+                calendar_minutes = (t_last - t_first).total_seconds() / 60
+            except Exception:
+                calendar_minutes = 0
+        active_minutes = int(min(len(turns) * 3, calendar_minutes))
+
+        conn.execute(
+            """INSERT OR REPLACE INTO sessions_meta
+               (session_id, project, first_ts, last_ts, turn_count, indexed_at, embedded_at,
+                topics, milestone_detected, deploy_detected, active_minutes)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (session_id, turns[0]["project"],
+             first_ts_str, last_ts_str,
+             len(turns), now_iso,
+             now_iso if embed_model is not None else None,
+             topics_json, milestone, deployed, active_minutes)
+        )
+        inserted_turns += len(turns)
+
+        if (i + 1) % 50 == 0:
+            conn.commit()
+            if verbose:
+                elapsed = time.time() - t0
+                print(f"  {i+1}/{len(new_files)} Sessions ({elapsed:.0f}s)...")
+
+    conn.commit()
+
+    elapsed = time.time() - t0
+    total_sessions = conn.execute("SELECT COUNT(*) FROM sessions_meta").fetchone()[0]
+    total_turns = conn.execute("SELECT COUNT(*) FROM turns_fts").fetchone()[0]
+    total_vecs = conn.execute("SELECT COUNT(*) FROM turns_vec").fetchone()[0]
+
+    if verbose:
+        embed_info = f", {total_vecs:,} Embeddings" if total_vecs > 0 else ""
+        print(f"Fertig in {elapsed:.1f}s — {total_sessions} Sessions, {total_turns:,} Turns{embed_info}")
+
+    return inserted_turns
+
+
+# --- Embeddings nachberechnen (Einmal-Migration + laufende Pflege) ---
+def build_embeddings(time_limit: int = 0, verbose: bool = True) -> int:
+    """
+    Berechnet Embeddings für alle Turns ohne Embedding.
+
+    time_limit: max Sekunden (0 = unbegrenzt). Für Janitor-Integration.
+    Gibt Anzahl neu eingebetteter Turns zurück.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        print("numpy fehlt: pip3 install numpy --break-system-packages", file=sys.stderr)
+        return 0
+
+    conn = get_db()
+
+    # Turns ohne Embedding finden
+    unembedded = conn.execute("""
+        SELECT f.rowid, f.text
+        FROM turns_fts f
+        LEFT JOIN turns_vec v ON f.rowid = v.rowid
+        WHERE v.rowid IS NULL
+        ORDER BY f.rowid
+    """).fetchall()
+
+    if not unembedded:
+        if verbose:
+            print("Alle Turns haben Embeddings.")
+        return 0
+
+    est_min = len(unembedded) / 20 / 60
+    if verbose:
+        print(f"Embeddings berechnen: {len(unembedded):,} Turns (~{est_min:.0f}min)", flush=True)
+
+    try:
+        from fastembed import TextEmbedding
+        embed_model = TextEmbedding(EMBED_MODEL)
+    except Exception as e:
+        print(f"Embedding-Modell nicht verfügbar: {e}", file=sys.stderr)
+        return 0
+
+    batch_size = 64
+    t0 = time.time()
+    inserted = 0
+
+    for bi in range(0, len(unembedded), batch_size):
+        if time_limit and (time.time() - t0) > time_limit:
+            if verbose:
+                print(f"  Zeit-Limit {time_limit}s erreicht — {inserted:,} Turns eingebettet.", flush=True)
+            break
+
+        batch = unembedded[bi:bi+batch_size]
+        texts = [r[1][:128] for r in batch]
+        vecs = list(embed_model.embed(texts))
+        conn.executemany(
+            "INSERT OR REPLACE INTO turns_vec(rowid, embedding) VALUES (?, ?)",
+            [(batch[j][0], np.array(vecs[j], dtype=np.float32).tobytes())
+             for j in range(len(batch))]
+        )
+        inserted += len(batch)
+
+        done_batches = (bi // batch_size) + 1
+        if done_batches % 20 == 0:
+            conn.commit()
+            if verbose:
+                elapsed = time.time() - t0
+                rate = inserted / max(elapsed, 0.01)
+                rem = (len(unembedded) - inserted) / max(rate, 1)
+                print(f"  {inserted:,}/{len(unembedded):,} ({rate:.0f}/s, ~{rem/60:.1f}min)", flush=True)
+
+    conn.commit()
+    elapsed = time.time() - t0
+
+    # embedded_at für eingebettete Sessions markieren
+    conn.execute(
+        "UPDATE sessions_meta SET embedded_at = ? WHERE embedded_at IS NULL",
+        (datetime.now().isoformat(),)
+    )
+    conn.commit()
+
+    total_vecs = conn.execute("SELECT COUNT(*) FROM turns_vec").fetchone()[0]
+    total_turns = conn.execute("SELECT COUNT(*) FROM turns_fts").fetchone()[0]
+
+    if verbose:
+        print(f"Fertig: {inserted:,} neue Embeddings in {elapsed:.1f}s | "
+              f"Gesamt: {total_vecs:,}/{total_turns:,} ({total_vecs/total_turns*100:.0f}%)", flush=True)
+
+    # NPY-Cache aktualisieren (fast lookup für search_semantic)
+    if inserted > 0:
+        if verbose:
+            print("  Schreibe NPY-Cache...", flush=True)
+        sync_npy_cache(conn, verbose=verbose)
+
+    return inserted
+
+
+# --- NPY-Cache sync (schneller Lesepfad für Semantic Search) ---
+def sync_npy_cache(conn=None, verbose=False) -> int:
+    """
+    Schreibt numpy binary cache + metadata pickle aus turns_vec.
+
+    Dateien:
+      EMBED_NPY   = pre-normalisierte float32 (N, 384)  → kein Normalisieren bei Suche
+      ROWIDS_NPY  = int64 sorted (N,)                   → für searchsorted
+      META_PKL    = pickle list[(rowid,sid,proj,ts,role)]→ kein FTS5-Scan bei Suche
+
+    Performance nach sync:
+      search_semantic() warm: ~0.3s (Bottleneck: query-embedding 0.12s)
+    """
+    try:
+        import numpy as np
+        import pickle
+    except ImportError:
+        return 0
+
+    if conn is None:
+        conn = get_db()
+
+    # Embeddings laden
+    vec_rows = conn.execute("SELECT rowid, embedding FROM turns_vec ORDER BY rowid").fetchall()
+    if not vec_rows:
+        if verbose:
+            print("  Keine Embeddings in turns_vec — NPY-Cache nicht gebaut.", flush=True)
+        return 0
+
+    rowids = np.array([r[0] for r in vec_rows], dtype=np.int64)
+    raw    = b"".join(r[1] for r in vec_rows)
+    embs   = np.frombuffer(raw, dtype=np.float32).reshape(len(vec_rows), EMBED_DIM).copy()
+
+    # Pre-normalisieren: spart 0.4s pro Suche (kein Normalisieren zur Query-Zeit)
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    embs_norm = embs / norms
+
+    np.save(ROWIDS_NPY, rowids)
+    np.save(EMBED_NPY,  embs_norm)
+
+    # Metadata für embedded turns (kein FTS5-Scan bei Suche)
+    # JOIN: nur Turns die Embeddings haben → N=35k statt 73k
+    meta_rows = conn.execute("""
+        SELECT f.rowid, f.session_id, f.project, f.timestamp, f.role
+        FROM turns_fts f
+        INNER JOIN turns_vec v ON f.rowid = v.rowid
+        ORDER BY f.rowid
+    """).fetchall()
+    META_PKL.write_bytes(pickle.dumps(meta_rows, protocol=4))
+
+    mb = EMBED_NPY.stat().st_size / 1024 / 1024
+    mb_pkl = META_PKL.stat().st_size / 1024 / 1024
+    if verbose:
+        print(f"  NPY-Cache: {len(vec_rows):,} Embeddings → {mb:.1f} MB | "
+              f"Meta-Pickle: {mb_pkl:.1f} MB", flush=True)
+    return len(vec_rows)
+
+
+# --- BM25-Suche ---
+def escape_fts_query(query: str, any_mode: bool = False) -> str:
+    """Escape special FTS5 characters, handle multi-word queries.
+
+    any_mode=False (default): AND  — alle Wörter müssen im Turn vorkommen
+    any_mode=True:            OR   — mind. ein Wort muss vorkommen (breitere Suche)
+    """
+    query = re.sub(r'["\*\(\)\:]', ' ', query)
+    words = [w for w in query.strip().split() if w]
+    if not words:
+        return '""'
+    sep = " OR " if any_mode else " "
+    return sep.join(f'"{w}"' for w in words)
+
+
+def utc_adjust_since(since: str) -> str:
+    """
+    Korrigiert --since Datum um UTC-Drift (Mac läuft CET = UTC+1/+2).
+    DB speichert Timestamps in UTC → --since '2026-03-22' würde UTC-Mitternacht suchen,
+    verliert aber Sessions von 23:00-00:00 CET.
+    Fix: 1 Stunde abziehen → 'WHERE timestamp >= 2026-03-21T23:00:00'.
+    """
+    # Validierung: nur YYYY-MM-DD akzeptiert — DD.MM.YYYY wird sonst silent ignoriert
+    import re as _re
+    if since and not _re.match(r'^\d{4}-\d{2}-\d{2}', since):
+        print(f"\033[33m⚠️  --since Format ungültig: '{since}' — erwartet YYYY-MM-DD (z.B. 2026-03-20)\033[0m", file=__import__('sys').stderr)
+        return "1970-01-01T00:00:00"  # Kein Filter — ungültiges Format
+    try:
+        dt = datetime.fromisoformat(since)
+        dt_adjusted = dt - timedelta(hours=1)
+        return dt_adjusted.strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return since  # Fallback: unverändertes Datum
+
+
+def search_bm25(query: str, project: str = None, role: str = None,
+                since: str = None, limit: int = 10, any_mode: bool = False,
+                milestone_only: bool = False, deployed_only: bool = False,
+                oldest_first: bool = False) -> list[dict]:
+    """BM25-Suche via SQLite FTS5."""
+    conn = get_db()
+    # sessions_meta hat regulären Index → O(1) Count (turns_fts Count = 3s FTS5-Scan)
+    total = conn.execute("SELECT COUNT(*) FROM sessions_meta").fetchone()[0]
+    if total == 0:
+        return []
+
+    norm_q = normalize(query)
+    fts_q = escape_fts_query(norm_q, any_mode=any_mode)
+
+    # Wenn Milestone/Deploy-Filter aktiv: zuerst erlaubte session_ids einschränken
+    session_filter_clause = ""
+    if milestone_only or deployed_only:
+        filter_parts = []
+        if milestone_only:
+            filter_parts.append("milestone_detected = 1")
+        if deployed_only:
+            filter_parts.append("deploy_detected = 1")
+        filter_sql = " AND ".join(filter_parts)
+        valid_sids = {row[0] for row in conn.execute(
+            f"SELECT session_id FROM sessions_meta WHERE {filter_sql}"
+        )}
+        if not valid_sids:
+            return []
+        # IN-Clause für SQLite (max 999 Elemente — kein Problem bei <500 Sessions)
+        placeholders = ",".join("?" * len(valid_sids))
+        session_filter_clause = f" AND session_id IN ({placeholders})"
+        session_sid_params = list(valid_sids)
+    else:
+        session_sid_params = []
+
+    conditions = "(turns_fts MATCH ?)"
+    params = [fts_q]
+
+    if project:
+        conditions += " AND project LIKE ?"
+        params.append(f"%{project.replace(' ', '%')}%")
+    if role:
+        conditions += " AND role = ?"
+        params.append(role)
+    if since:
+        conditions += " AND timestamp >= ?"
+        params.append(utc_adjust_since(since))
+
+    conditions += session_filter_clause
+
+    order_clause = "ORDER BY timestamp ASC" if oldest_first else "ORDER BY bm25(turns_fts)"
+
+    try:
+        rows = conn.execute(f"""
+            SELECT
+                session_id, project, timestamp, role, text,
+                bm25(turns_fts) AS score,
+                snippet(turns_fts, 5, '\033[33m', '\033[0m', '...', 30) AS snip
+            FROM turns_fts
+            WHERE {conditions}
+            {order_clause}
+            LIMIT ?
+        """, params + session_sid_params + [limit]).fetchall()
+    except sqlite3.OperationalError:
+        try:
+            rows = conn.execute(f"""
+                SELECT session_id, project, timestamp, role, text,
+                       bm25(turns_fts) AS score, text AS snip
+                FROM turns_fts WHERE {conditions}
+                {order_clause} LIMIT ?
+            """, params + session_sid_params + [limit]).fetchall()
+        except Exception:
+            return []
+
+    results = []
+    for r in rows:
+        sid, proj, ts, role_r, text, score, snip = r
+        results.append({
+            "session_id": sid,
+            "project": proj,
+            "timestamp": ts,
+            "role": role_r,
+            "score": score,
+            "snippet": snip,
+            "text_preview": text[:200],
+        })
+    return results
+
+
+# --- Semantic-Suche (numpy memmap — schnell) ---
+def search_semantic(query: str, project: str = None, role: str = None,
+                    since: str = None, limit: int = 10,
+                    milestone_only: bool = False, deployed_only: bool = False,
+                    oldest_first: bool = False) -> list[dict]:
+    """
+    Semantic Search via numpy memmap.
+
+    Performance: ~0.5s für 73k Turns (OS-gecacht nach erster Query: ~0.4s).
+    Bottleneck: Query-Embedding (0.3s) + FTS5-Scan (0.1s) + numpy (0.05s).
+    Voraussetzung: sss --embed ausgeführt (npy-Cache gebaut).
+
+    Warum schnell: numpy-Dateien liegen nach erster Query im OS-Page-Cache
+    → kein Disk-I/O mehr. Keine SQLite-JOIN über 112 MB BLOBs.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        print("numpy fehlt: pip3 install numpy --break-system-packages", file=sys.stderr)
+        return []
+
+    # NPY-Cache prüfen
+    if not EMBED_NPY.exists() or not ROWIDS_NPY.exists():
+        # Fallback: NPY aus DB bauen falls turns_vec gefüllt
+        conn = get_db()
+        vec_count = conn.execute("SELECT COUNT(*) FROM turns_vec").fetchone()[0]
+        if vec_count == 0:
+            print("Keine Embeddings. Bitte ausführen: sss --embed", file=sys.stderr)
+            return []
+        print("NPY-Cache fehlt — baue aus DB...", file=sys.stderr)
+        sync_npy_cache(conn)
+
+    # Query embedden (Model gecacht, 0.3s beim ersten Aufruf)
+    model = get_embed_model()
+    if not model:
+        return []
+
+    query_vec = np.array(list(model.embed([query]))[0], dtype=np.float32)
+    query_norm = query_vec / (np.linalg.norm(query_vec) or 1.0)
+
+    conn = get_db()
+
+    import pickle
+
+    # Metadata aus Pickle laden (kein FTS5-Scan: 0.04s statt 2.66s)
+    # meta_all[i] entspricht EMBED_NPY[i] — gleiche Reihenfolge (ORDER BY rowid)
+    meta_all = pickle.loads(META_PKL.read_bytes())
+
+    # Milestone/Deploy-Filter: erlaubte session_ids vorab laden
+    allowed_sids = None
+    if milestone_only or deployed_only:
+        conn_f = get_db()
+        filter_parts = []
+        if milestone_only:
+            filter_parts.append("milestone_detected = 1")
+        if deployed_only:
+            filter_parts.append("deploy_detected = 1")
+        filter_sql = " AND ".join(filter_parts)
+        allowed_sids = {row[0] for row in conn_f.execute(
+            f"SELECT session_id FROM sessions_meta WHERE {filter_sql}"
+        )}
+        if not allowed_sids:
+            return []
+
+    # Filter in Python (schnell: ~0.01s für 39k Tuples)
+    since_adjusted = utc_adjust_since(since) if since else None
+    if project or role or since or allowed_sids is not None:
+        pf = project.lower() if project else None
+        filtered = [
+            (i, m) for i, m in enumerate(meta_all)
+            if (not pf or pf in m[2].lower())
+            and (not role or m[4] == role)
+            and (not since_adjusted or m[3] >= since_adjusted)
+            and (allowed_sids is None or m[1] in allowed_sids)
+        ]
+        if not filtered:
+            return []
+        filter_indices, valid_meta = zip(*filtered)
+        filter_indices = list(filter_indices)
+    else:
+        valid_meta   = meta_all
+        filter_indices = None   # alle
+
+    # Embeddings laden: immer ganzes File (58 MB, 0.05s nach OS-Cache)
+    # Schneller als memmap + fancy indexing (1.1s für 39k Rows)
+    all_embs = np.load(str(EMBED_NPY))    # pre-normalisiert, float32
+    embs = all_embs[filter_indices] if filter_indices is not None else all_embs
+
+    # Dot product = cosine (pre-normalisiert → normalization entfällt)
+    scores = embs @ query_norm
+
+    # Top-K: bei --oldest nach Timestamp sortieren statt nach Score
+    if oldest_first:
+        timestamps = [m[3] for m in valid_meta]
+        top_k = sorted(range(len(valid_meta)), key=lambda i: timestamps[i])[:limit]
+    else:
+        top_k = np.argsort(scores)[::-1][:limit]
+
+    # text nur für top-k nachladen (N=limit rowid-Lookups)
+    conn = get_db()
+    results = []
+    for i in top_k:
+        m = valid_meta[i]   # (rowid, sid, proj, ts, role)
+        text_row = conn.execute(
+            "SELECT text FROM turns_fts WHERE rowid = ?", (m[0],)
+        ).fetchone()
+        text = text_row[0] if text_row else ""
+        results.append({
+            "session_id": m[1],
+            "project":    m[2],
+            "timestamp":  m[3],
+            "role":       m[4],
+            "score":      float(scores[i]),
+            "snippet":    text[:300],
+            "text_preview": text[:200],
+        })
+    return results
+
+
+# --- Hybrid RRF (Reciprocal Rank Fusion) ---
+def reciprocal_rank_fusion(list1: list[dict], list2: list[dict], k: int = 60) -> list[dict]:
+    """
+    RRF kombiniert zwei Ranglisten zu einem finalen Ranking.
+    Standard in hybrider Suche (Elasticsearch, Vespa etc.)
+    Score = 1/(k + rank1) + 1/(k + rank2)
+    """
+    scores = {}
+    snippets = {}
+    meta = {}
+
+    for rank, item in enumerate(list1):
+        key = (item["session_id"], item["timestamp"])
+        scores[key] = scores.get(key, 0) + 1.0 / (k + rank + 1)
+        snippets[key] = item.get("snippet", "")
+        meta[key] = item
+
+    for rank, item in enumerate(list2):
+        key = (item["session_id"], item["timestamp"])
+        scores[key] = scores.get(key, 0) + 1.0 / (k + rank + 1)
+        if key not in snippets:
+            snippets[key] = item.get("snippet", "")
+        if key not in meta:
+            meta[key] = item
+
+    sorted_keys = sorted(scores.keys(), key=lambda k: -scores[k])
+    results = []
+    for key in sorted_keys:
+        item = dict(meta[key])
+        item["score"] = scores[key]
+        item["snippet"] = snippets[key]
+        results.append(item)
+    return results
+
+
+# --- Output ---
+def format_project(project: str) -> str:
+    """Kürzt den Projekt-Pfad für lesbare Ausgabe."""
+    p = project.replace("-Users-f-s-Desktop-", "~/")
+    p = p.replace("-SCALE-GROUP-SEO-BASE", "SEO BASE")
+    p = p.replace("-", " ").replace("~/ ", "~/")
+    return p
+
+
+def format_age(ts_str: str) -> str:
+    """Relative Altersangabe eines Timestamps."""
+    try:
+        ts = datetime.fromisoformat(ts_str[:19])
+        secs = (datetime.now() - ts).total_seconds()
+        if secs < 3600:
+            return f"\033[32mvor {int(secs/60)}m\033[0m"
+        elif secs < 86400:
+            return f"\033[32mvor {int(secs/3600)}h\033[0m"
+        elif secs < 86400 * 7:
+            return f"\033[33mvor {int(secs/86400)}d\033[0m"
+        else:
+            return f"\033[90mvor {int(secs/86400)}d\033[0m"
+    except Exception:
+        return ""
+
+
+def print_results(results: list[dict], query: str, mode: str, elapsed: float,
+                  any_mode: bool = False, zero_terms: list = None):
+    if not results:
+        print(f"\n  Keine Ergebnisse für '{query}' ({mode}, {elapsed:.2f}s)")
+        if zero_terms:
+            print(f"  \033[33m⚠️  Kein Match für: {', '.join(zero_terms)}\033[0m")
+        print(f"  Tipp: sss --index  # Index aufbauen falls noch nicht geschehen")
+        return
+
+    print(f"\n\033[1m{'='*60}\033[0m")
+    print(f"  {mode.upper()}: \"{query}\"")
+    print(f"  {len(results)} Treffer in {elapsed:.2f}s")
+    if zero_terms:
+        print(f"  \033[33m⚠️  Kein Match für: {', '.join(zero_terms)} (ignoriert)\033[0m")
+    print(f"\033[1m{'='*60}\033[0m\n")
+
+    for i, r in enumerate(results, 1):
+        ts = r.get("timestamp", "")[:16]
+        sid_short = r.get("session_id", "")[:8]
+        role = "USER" if r.get("role") == "user" else "ASST"
+        proj = format_project(r.get("project", ""))
+        snip = r.get("snippet", r.get("text_preview", ""))[:300]
+        snip = " ".join(snip.split())
+        age = format_age(r.get("timestamp", ""))
+
+        print(f"  [{i}] {ts}  {role}  [{sid_short}]  ({proj})  {age}")
+        print(f"       {snip}")
+        print(f"       \033[36m→ read-session {sid_short} --last 5\033[0m\n")
+
+
+# --- Stats ---
+def print_stats():
+    conn = get_db()
+    total_sessions = conn.execute("SELECT COUNT(*) FROM sessions_meta").fetchone()[0]
+    total_turns = conn.execute("SELECT COUNT(*) FROM turns_fts").fetchone()[0]
+    total_vecs = conn.execute("SELECT COUNT(*) FROM turns_vec").fetchone()[0]
+    first_ts = conn.execute("SELECT MIN(first_ts) FROM sessions_meta").fetchone()[0]
+    last_ts = conn.execute("SELECT MAX(last_ts) FROM sessions_meta").fetchone()[0]
+    db_size = Path(INDEX_DB).stat().st_size / 1024 / 1024 if Path(INDEX_DB).exists() else 0
+    embed_pct = (total_vecs / total_turns * 100) if total_turns > 0 else 0
+
+    milestone_count = conn.execute("SELECT COUNT(*) FROM sessions_meta WHERE milestone_detected=1").fetchone()[0]
+    deploy_count    = conn.execute("SELECT COUNT(*) FROM sessions_meta WHERE deploy_detected=1").fetchone()[0]
+    milestone_pct   = (milestone_count / total_sessions * 100) if total_sessions > 0 else 0
+    deploy_pct      = (deploy_count / total_sessions * 100) if total_sessions > 0 else 0
+
+    # active_hours: nur Sessions mit gesetztem active_minutes-Wert
+    active_row = conn.execute(
+        "SELECT ROUND(SUM(active_minutes)/60.0, 1), COUNT(*) FROM sessions_meta WHERE active_minutes IS NOT NULL"
+    ).fetchone()
+    total_active_h = active_row[0] or 0
+    sessions_with_time = active_row[1] or 0
+
+    # Top-5-Topics via json_each
+    top_topics = []
+    try:
+        top_topics = conn.execute("""
+            SELECT value, COUNT(*) as cnt
+            FROM sessions_meta, json_each(topics)
+            WHERE topics IS NOT NULL AND topics != '[]'
+            GROUP BY value ORDER BY cnt DESC LIMIT 5
+        """).fetchall()
+    except Exception:
+        pass
+
+    # Growth projection: turns indexed in last 7 days
+    turns_7d = conn.execute(
+        "SELECT COUNT(*) FROM turns_fts t INNER JOIN sessions_meta m ON t.session_id = m.session_id"
+        " WHERE m.last_ts > datetime('now', '-7 days')"
+    ).fetchone()[0]
+    mb_per_turn = db_size / total_turns if total_turns else 0
+    growth_30d = turns_7d / 7 * 30 * mb_per_turn
+    npy_size = EMBED_NPY.stat().st_size / 1024 / 1024 if EMBED_NPY.exists() else 0
+
+    print(f"\n{'='*52}")
+    print(f"  Smart Session Search — Index-Statistiken")
+    print(f"{'='*52}")
+    print(f"  Sessions indexiert: {total_sessions}")
+    print(f"  Turns (BM25):       {total_turns:,}")
+    print(f"  Turns (Semantic):   {total_vecs:,}  ({embed_pct:.0f}% Coverage)")
+    print(f"  Milestones:         {milestone_count}  ({milestone_pct:.0f}%)")
+    print(f"  Deploys:            {deploy_count}  ({deploy_pct:.0f}%)")
+    print(f"  Aktiv-Zeit (est.):  {total_active_h}h ({sessions_with_time} Sessions)")
+    print(f"  Zeitraum:           {first_ts[:10] if first_ts else '?'} → {last_ts[:10] if last_ts else '?'}")
+    print(f"  Index-Größe:        {db_size:.1f} MB  (NPY: {npy_size:.1f} MB)")
+    print(f"  Wachstum 30d (est): +{growth_30d:.0f} MB DB")
+    if growth_30d > 300:
+        print(f"  \033[33m⚠️  Hohes Wachstum! Bei >500MB: sss --vacuum empfohlen\033[0m")
+    print(f"  Index-Pfad:         {INDEX_DB}")
+    if top_topics:
+        topics_str = ", ".join(f"{t[0]} ({t[1]})" for t in top_topics)
+        print(f"  Top Topics:         {topics_str}")
+    print()
+
+
+# --- List Milestones (direkte DB-Abfrage ohne FTS5) ---
+def list_milestones(project: str = None, since: str = None):
+    """Alle Sessions mit milestone_detected=1, chronologisch, ohne FTS5."""
+    conn = get_db()
+
+    sql = """
+        SELECT session_id, project, first_ts, last_ts, turn_count,
+               deploy_detected, active_minutes
+        FROM sessions_meta
+        WHERE milestone_detected = 1
+    """
+    params = []
+    if project:
+        sql += " AND project LIKE ?"
+        params.append(f"%{project.replace(' ', '%')}%")
+    if since:
+        sql += " AND last_ts >= ?"
+        params.append(since)
+    sql += " ORDER BY last_ts DESC"
+
+    rows = conn.execute(sql, params).fetchall()
+
+    if not rows:
+        print("\n  Keine Milestone-Sessions gefunden.")
+        print("  Tipp: sss --fingerprint-all  # erst klassifizieren")
+        return
+
+    # Nur echte Milestones: mind. 5 Turns (keine 2-Turn-Automation-Artefakte)
+    rows = [r for r in rows if r[4] >= 5]
+    if not rows:
+        print("\n  Keine Milestone-Sessions gefunden (nach Mindest-Filter).")
+        return
+
+    print(f"\n  Milestone-Sessions ({len(rows)} total):\n")
+    for sid, proj, first_ts, last_ts, turns, deployed, active_min in rows:
+        date = last_ts[:10] if last_ts else "?"
+        proj_fmt = format_project(proj)
+        deploy_flag = " deploy ✓" if deployed else ""
+        time_str = f"  {active_min}min" if active_min else ""
+        print(f"  [{date}] {proj_fmt} ({turns} Turns){time_str} milestone ✓{deploy_flag}")
+        print(f"    → read-session {sid[:8]} --context\n")
+
+
+# --- List Topics (json_each Aggregation) ---
+def list_topics(project: str = None):
+    """Topic-Verteilung aus sessions_meta.topics via json_each."""
+    conn = get_db()
+
+    sql = """
+        SELECT value, COUNT(*) as cnt
+        FROM sessions_meta, json_each(topics)
+        WHERE topics IS NOT NULL AND topics != '[]'
+    """
+    params = []
+    if project:
+        sql += " AND project LIKE ?"
+        params.append(f"%{project.replace(' ', '%')}%")
+    sql += " GROUP BY value ORDER BY cnt DESC"
+
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except Exception as e:
+        print(f"  Fehler bei Topic-Abfrage: {e}", file=sys.stderr)
+        return
+
+    if not rows:
+        print("\n  Keine Topics gefunden. Tipp: sss --fingerprint-all")
+        return
+
+    total = sum(r[1] for r in rows)
+    max_cnt = rows[0][1] if rows else 1
+    print(f"\n  Topic-Verteilung ({total} klassifizierte Sessions):\n")
+    for topic, cnt in rows:
+        bar = "█" * max(1, int(cnt / max_cnt * 40))
+        print(f"  {topic:<18} {cnt:>4}  {bar}")
+    print()
+
+
+# --- Direct milestone/deployed search (leer query → kein FTS5) ---
+def search_direct_filter(milestone_only: bool = False, deployed_only: bool = False,
+                          project: str = None, since: str = None, limit: int = 20,
+                          oldest_first: bool = False) -> list[dict]:
+    """
+    Direkte SQL-Abfrage auf sessions_meta — kein FTS5, kein leerer Query-String.
+    Für: sss "" --milestone und sss "" --deployed.
+
+    Gibt Sessions-Metadaten zurück (keine Turn-Snippets).
+    """
+    conn = get_db()
+
+    filter_parts = []
+    if milestone_only:
+        filter_parts.append("milestone_detected = 1")
+    if deployed_only:
+        filter_parts.append("deploy_detected = 1")
+
+    where = " AND ".join(filter_parts) if filter_parts else "1=1"
+    params = []
+
+    sql = f"""
+        SELECT session_id, project, last_ts, turn_count,
+               milestone_detected, deploy_detected, active_minutes
+        FROM sessions_meta
+        WHERE {where}
+    """
+    if project:
+        sql += " AND project LIKE ?"
+        params.append(f"%{project.replace(' ', '%')}%")
+    if since:
+        sql += " AND last_ts >= ?"
+        params.append(since)
+    order = "ASC" if oldest_first else "DESC"
+    sql += f" ORDER BY last_ts {order} LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(sql, params).fetchall()
+
+    results = []
+    for sid, proj, last_ts, turns, milestone, deployed, active_min in rows:
+        flags = []
+        if milestone:
+            flags.append("milestone ✓")
+        if deployed:
+            flags.append("deploy ✓")
+        flags_str = "  ".join(flags)
+        time_str = f"  {active_min}min" if active_min else ""
+        results.append({
+            "session_id": sid,
+            "project": proj,
+            "timestamp": last_ts,
+            "role": "session",
+            "score": 0.0,
+            "snippet": f"({turns} Turns){time_str}  {flags_str}",
+            "text_preview": f"({turns} Turns){time_str}  {flags_str}",
+        })
+    return results
+
+
+# --- Projekt-Briefing ---
+def generate_briefing(project_name: str):
+    """
+    Vollständiges Projekt-Briefing für ein Thema/Projekt.
+
+    Strategie: Sessions werden via topics LIKE %{project}% gefiltert — weil
+    bier-genuss, briefadler etc. als Topics in sessions_meta.topics gespeichert sind,
+    nicht als eigenes Claude-Projekt (alle laufen unter SEO-BASE).
+
+    Fallback: Wenn topics-Filter nichts findet, wird project LIKE %{project}% probiert.
+    """
+    conn = get_db()
+    pname = project_name.lower().replace(" ", "-")
+
+    # Primär: Topics-Filter (bier-genuss, briefadler, tiroler etc.)
+    topic_rows = conn.execute(
+        "SELECT COUNT(*) FROM sessions_meta WHERE topics LIKE ?",
+        (f"%{pname}%",)
+    ).fetchone()[0]
+
+    # Fuzzy: Wenn exact match 0, alle bekannten Topics laden und Präfix-Match suchen
+    if topic_rows == 0:
+        import json as _json
+        all_topic_rows = conn.execute("SELECT DISTINCT topics FROM sessions_meta WHERE topics IS NOT NULL").fetchall()
+        known_topics = set()
+        for (t,) in all_topic_rows:
+            try:
+                known_topics.update(_json.loads(t))
+            except Exception:
+                pass
+        # Suche: Welches Topic startet mit pname oder enthält pname?
+        candidates = [t for t in known_topics if t.startswith(pname) or pname.startswith(t) or pname in t]
+        if candidates:
+            # Kürzestes (spezifischstes) Topic nehmen
+            pname = min(candidates, key=len)
+            topic_rows = conn.execute(
+                "SELECT COUNT(*) FROM sessions_meta WHERE topics LIKE ?",
+                (f"%{pname}%",)
+            ).fetchone()[0]
+
+    if topic_rows > 0:
+        filter_sql = "topics LIKE ?"
+        filter_param = f"%{pname}%"
+        filter_label = f"topic:{pname}"
+    else:
+        # Fallback: project-Spalte (für eigenständige Projekte wie SEO-BASE selbst)
+        filter_sql = "project LIKE ?"
+        filter_param = f"%{pname.replace('-', '%')}%"
+        filter_label = f"project:{pname}"
+
+    # --- Statistiken ---
+    stats = conn.execute(f"""
+        SELECT
+            COUNT(*) as sessions,
+            SUM(turn_count) as turns,
+            MIN(first_ts) as first_ts,
+            MAX(last_ts) as last_ts,
+            SUM(active_minutes) as total_minutes,
+            SUM(milestone_detected) as milestones,
+            SUM(deploy_detected) as deploys
+        FROM sessions_meta WHERE {filter_sql}
+    """, (filter_param,)).fetchone()
+
+    if not stats or stats[0] == 0:
+        print(f"\n  Kein Projekt gefunden für: '{project_name}'")
+        print(f"  Tipp: sss --list-topics  # verfügbare Themen anzeigen")
+        print(f"        sss --fingerprint-all  # erst alle Sessions klassifizieren")
+        return
+
+    session_count, turn_count, first_ts_str, last_ts_str, total_minutes, milestones, deploys = stats
+    turn_count = turn_count or 0
+    total_minutes = total_minutes or 0
+    active_hours = total_minutes / 60
+
+    # Zeitraum berechnen
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    first_date = first_ts_str[:10] if first_ts_str else "?"
+    last_date  = last_ts_str[:10] if last_ts_str else "?"
+
+    days_ago = "?"
+    if last_ts_str:
+        try:
+            last_dt = datetime.fromisoformat(last_ts_str[:19])
+            today_dt = datetime.now()
+            diff = (today_dt - last_dt).days
+            days_ago = f"vor {diff} Tag{'en' if diff != 1 else ''}" if diff > 0 else "heute"
+        except Exception:
+            days_ago = "?"
+
+    # --- Top Topics dieser Sessions ---
+    # Alle Sessions holen, dann Topics aggregieren
+    all_session_topics = conn.execute(
+        f"SELECT topics FROM sessions_meta WHERE {filter_sql} AND topics IS NOT NULL AND topics != '[]'",
+        (filter_param,)
+    ).fetchall()
+    topic_counter: dict[str, int] = {}
+    for (tj,) in all_session_topics:
+        try:
+            for t in json.loads(tj):
+                if t.lower() != pname:  # eigenes Projekt-Label nicht mitzählen
+                    topic_counter[t] = topic_counter.get(t, 0) + 1
+        except Exception:
+            pass
+    top_topics = sorted(topic_counter.items(), key=lambda x: -x[1])[:5]
+
+    # --- Letzte 5 Milestone-Sessions ---
+    milestone_rows = conn.execute(f"""
+        SELECT session_id, last_ts, turn_count, deploy_detected, active_minutes
+        FROM sessions_meta
+        WHERE {filter_sql} AND milestone_detected = 1
+        ORDER BY last_ts DESC LIMIT 5
+    """, (filter_param,)).fetchall()
+
+    # --- Letzte 3 Sessions gesamt ---
+    recent_rows = conn.execute(f"""
+        SELECT session_id, last_ts, turn_count, milestone_detected, deploy_detected, active_minutes
+        FROM sessions_meta
+        WHERE {filter_sql}
+        ORDER BY last_ts DESC LIMIT 3
+    """, (filter_param,)).fetchall()
+
+    # --- Bekannte Probleme: Sessions mit Fehler-Turns (letzte 30 Tage) ---
+    since_30d = (datetime.now().replace(hour=0, minute=0, second=0)
+                 .__class__.fromisocalendar(datetime.now().year, max(1, datetime.now().isocalendar()[1] - 4), 1)
+                 .isoformat())
+    # Einfacherer Ansatz: letzten 30 Tage via String-Vergleich
+    from datetime import timedelta
+    since_30d = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+
+    # Sessions IDs für dieses Projekt holen (max 100 für IN-Clause)
+    project_sids = [r[0] for r in conn.execute(
+        f"SELECT session_id FROM sessions_meta WHERE {filter_sql} AND last_ts >= ? ORDER BY last_ts DESC LIMIT 100",
+        (filter_param, since_30d)
+    ).fetchall()]
+
+    problem_sessions: list[tuple] = []
+    if project_sids:
+        placeholders = ",".join("?" * len(project_sids))
+        # Turns mit Fehler-Keywords: gruppiert pro Session, älteste zuerst → "bekannte Probleme"
+        # Nur hochsignalige Fehler-Keywords (nicht "fix"/"problem" — zu breit in deutschen Texten)
+        prob_turns = conn.execute(f"""
+            SELECT f.session_id, f.timestamp, f.text
+            FROM turns_fts f
+            INNER JOIN sessions_meta m ON f.session_id = m.session_id
+            WHERE f.session_id IN ({placeholders})
+              AND f.role = 'assistant'
+              AND LENGTH(f.text) > 200
+              AND (
+                f.text LIKE '%fehlgeschlagen%' OR f.text LIKE '%traceback%'
+                OR f.text LIKE '%exit code 1%' OR f.text LIKE '%broken%'
+                OR f.text LIKE '%noindex%' OR f.text LIKE '%404%'
+              )
+            ORDER BY f.timestamp DESC LIMIT 10
+        """, project_sids).fetchall()
+
+        # Pro Session max 1 Eintrag, max 3 Sessions
+        HIGH_SIGNAL = ["fehlgeschlagen", "traceback", "exit code 1", "broken", "noindex", "404"]
+        seen_sids: set[str] = set()
+        for sid, ts, text in prob_turns:
+            if sid not in seen_sids:
+                seen_sids.add(sid)
+                # Knappe Zusammenfassung: erste Zeile des Texts die den Begriff enthält
+                summary = ""
+                for line in text.split("\n"):
+                    line_l = line.lower()
+                    if any(kw in line_l for kw in HIGH_SIGNAL):
+                        summary = line.strip()[:100]
+                        break
+                if not summary:
+                    summary = text[:100].strip()
+                problem_sessions.append((ts[:10], sid[:8], summary))
+            if len(problem_sessions) >= 3:
+                break
+
+    # --- Output ---
+    width = 52
+    title = f"PROJEKT-BRIEFING: {project_name}"
+    print(f"\n\033[1m╔{'═' * width}╗\033[0m")
+    print(f"\033[1m║  {title:<{width-2}}║\033[0m")
+    print(f"\033[1m║  Stand: {today_str} | {session_count} Sessions | {turn_count:,} Turns{'':<{width-2-len(f'Stand: {today_str} | {session_count} Sessions | {turn_count:,} Turns')}}║\033[0m")
+    print(f"\033[1m╚{'═' * width}╝\033[0m")
+
+    print(f"\n\033[1m## Aktivität\033[0m")
+    print(f"  Erste Session:   {first_date}")
+    print(f"  Letzte Session:  {last_date}  ({days_ago})")
+    print(f"  Aktiv-Zeit est.: {active_hours:.1f}h  |  Milestones: {milestones}  |  Deploys: {deploys}")
+    print(f"  Filter:          {filter_label}")
+
+    if top_topics:
+        print(f"\n\033[1m## Top Topics (Co-Themen)\033[0m")
+        topics_str = " · ".join(f"{t} ({c})" for t, c in top_topics)
+        print(f"  {topics_str}")
+
+    if milestone_rows:
+        print(f"\n\033[1m## Letzte {len(milestone_rows)} Milestones\033[0m")
+        for sid, last_ts, turns, dep, act_min in milestone_rows:
+            date = last_ts[:10] if last_ts else "?"
+            deploy_flag = "  deploy ✓" if dep else ""
+            time_str = f"  {(act_min or 0)//60}h{(act_min or 0)%60}m" if act_min and act_min > 0 else ""
+            print(f"  [{date}] {turns} Turns{time_str}{deploy_flag}")
+            print(f"    \033[36m→ read-session {sid[:8]} --context\033[0m")
+    else:
+        print(f"\n\033[1m## Milestones\033[0m")
+        print(f"  Keine Milestone-Sessions gefunden. Tipp: sss --fingerprint-all")
+
+    if problem_sessions:
+        print(f"\n\033[1m## Bekannte Probleme (letzte 30 Tage)\033[0m")
+        for date, sid, summary in problem_sessions:
+            print(f"  [{date}] {summary}")
+            print(f"    \033[36m→ read-session {sid} --last 5\033[0m")
+
+    print(f"\n\033[1m## Letzte {len(recent_rows)} Sessions\033[0m")
+    for sid, last_ts, turns, ms, dep, act_min in recent_rows:
+        date = last_ts[:10] if last_ts else "?"
+        flags = []
+        if ms:
+            flags.append("milestone ✓")
+        if dep:
+            flags.append("deploy ✓")
+        flags_str = " · ".join(flags)
+        time_str = f"  {(act_min or 0)//60}h{(act_min or 0)%60}m" if act_min and act_min > 0 else ""
+        print(f"  [{date}] {turns} Turns{time_str}  {flags_str}")
+        print(f"    \033[36m→ read-session {sid[:8]} --context\033[0m")
+    print()
+
+
+# --- Main ---
+def main():
+    parser = argparse.ArgumentParser(description="Smart Session Search — BM25 + Semantic")
+    parser.add_argument("query", nargs="*", help="Suchbegriff")
+    parser.add_argument("--semantic", "-s", action="store_true", help="Semantic-Suche (pre-computed, ~0.4s)")
+    parser.add_argument("--hybrid", "-H", action="store_true", help="BM25 + Semantic (beste Qualität)")
+    parser.add_argument("--project", "-p", default=None, help="Projekt-Filter (Substring)")
+    parser.add_argument("--role", "-r", choices=["user","assistant"], default=None)
+    parser.add_argument("--since", default=None, help="Ab Datum (YYYY-MM-DD)")
+    parser.add_argument("--limit", "-l", type=int, default=10)
+    parser.add_argument("--any", "-a", action="store_true",
+                        help="OR-Suche: mind. ein Wort muss vorkommen (statt AND für alle Wörter)")
+    parser.add_argument("--index", "-i", action="store_true", help="FTS5 aufbauen/aktualisieren (schnell)")
+    parser.add_argument("--embed", "-e", action="store_true",
+                        help="Embeddings für alle uneingebetteten Turns berechnen (~60min initial)")
+    parser.add_argument("--force", "-f", action="store_true", help="Index komplett neu aufbauen")
+    parser.add_argument("--stats", action="store_true", help="Index-Statistiken")
+    parser.add_argument("--milestone", action="store_true",
+                        help="Nur Sessions mit erkanntem Milestone/Go-Live/Abschluss")
+    parser.add_argument("--deployed", action="store_true",
+                        help="Nur Sessions in denen ein Deploy-Befehl ausgeführt wurde")
+    parser.add_argument("--oldest", action="store_true",
+                        help="Älteste Treffer zuerst (statt Relevanz) — für ersten Auftritt eines Themas")
+    parser.add_argument("--fingerprint-all", action="store_true",
+                        help="Alle bestehenden Sessions klassifizieren (Batch-Run, ~1-2 Min)")
+    parser.add_argument("--list-milestones", action="store_true",
+                        help="Alle Milestone-Sessions chronologisch auflisten (kein Query nötig)")
+    parser.add_argument("--list-topics", action="store_true",
+                        help="Topic-Verteilung aus sessions_meta ausgeben")
+    parser.add_argument("--unique", "-u", action="store_true",
+                        help="Nur ein Treffer pro Session (bester) — verhindert Same-Session-Dominanz")
+    parser.add_argument("--briefing", metavar="PROJECT", default=None,
+                        help="Vollständiges Projekt-Briefing (z.B. --briefing bier-genuss)")
+    parser.add_argument("--open", metavar="TOPIC", default=None,
+                        help="Letzte offene (nicht abgeschlossene) Session zu einem Topic finden")
+    parser.add_argument("--continuation", metavar="TOPIC", default=None,
+                        help="Finde Vorgänger-Session von heute zu einem Topic (Session-Ketten)")
+
+    args = parser.parse_args()
+
+    if getattr(args, "continuation", None):
+        topic = args.continuation
+        conn = get_db()
+        import json as _json
+        from datetime import datetime as _dt, timedelta as _td
+        # Letzte 48h Sessions mit diesem Topic — zeige alle als Kontext-Kette
+        cutoff = (_dt.now() - _td(hours=48)).isoformat()
+        # Fuzzy-Matching: erst exakt, dann Prefix-Suche (konsistent mit --briefing)
+        _topic_pat = f'%{topic.lower()}%'
+        rows_cont = conn.execute("""
+            SELECT session_id, first_ts, last_ts, turn_count, milestone_detected, deploy_detected, topics
+            FROM sessions_meta
+            WHERE topics LIKE ? AND last_ts >= ? AND turn_count > 5
+              AND NOT (topics LIKE '%autonomous%' AND turn_count < 30)
+            ORDER BY last_ts DESC LIMIT 5
+        """, (_topic_pat, cutoff)).fetchall()
+        # Kein Treffer → Prefix-Fuzzy (erste 4 Zeichen)
+        if not rows_cont and len(topic) >= 4:
+            _fuzzy_pat = f'%{topic.lower()[:4]}%'
+            rows_cont = conn.execute("""
+                SELECT session_id, first_ts, last_ts, turn_count, milestone_detected, deploy_detected, topics
+                FROM sessions_meta
+                WHERE topics LIKE ? AND last_ts >= ? AND turn_count > 5
+                  AND NOT (topics LIKE '%autonomous%' AND turn_count < 30)
+                ORDER BY last_ts DESC LIMIT 5
+            """, (_fuzzy_pat, cutoff)).fetchall()
+            if rows_cont:
+                import json as _j2
+                found_topics = set()
+                for r in rows_cont:
+                    try: found_topics.update(_j2.loads(r[6]))
+                    except: pass
+                import sys as _s2
+                print(f"  \033[33m(Fuzzy: '{topic}' → gefundene Topics: {sorted(found_topics)})\033[0m", file=_s2.stderr)
+
+        print(f"\n\033[1m{'='*60}\033[0m")
+        print(f"  CONTINUATION: '{topic}'  (letzte 48h)")
+        print(f"\033[1m{'='*60}\033[0m\n")
+
+        if not rows_cont:
+            print(f"  Keine Session zu '{topic}' in den letzten 48h gefunden.")
+        else:
+            for i, (sid, first_ts, last_ts, tc, ms, dp, tj) in enumerate(rows_cont):
+                topics_list = _json.loads(tj) if tj else []
+                sid_short = sid[:8]
+                status = "✅" if (ms or dp) else "🔄"
+                label = "LETZTE" if i == 0 else f"DAVOR {i}"
+                print(f"  [{label}] {last_ts[:16]}  {status}  [{sid_short}]  ({tc} Turns)")
+                print(f"          {topics_list}")
+                cmd = "--context" if i == 0 else "--last 3"
+                print(f"          \033[36m→ read-session {sid_short} {cmd}\033[0m")
+                print()
+        return
+
+    if getattr(args, "open", None):
+        topic = args.open
+        conn = get_db()
+        # Pro Topic: letzte Session ohne Milestone UND ohne Deploy (= offen/unterbrochen)
+        # Suche erst mit Ergebnis (Milestone/Deploy), dann ohne — zeige aktuellsten Stand
+        # Autonome System-Sessions ausschliessen: (autonomous-Topic + <30 Turns = Hintergrundprozess)
+        row_open = conn.execute("""
+            SELECT session_id, last_ts, turn_count, milestone_detected, deploy_detected, topics
+            FROM sessions_meta
+            WHERE topics LIKE ? AND turn_count > 10
+              AND milestone_detected = 0 AND deploy_detected = 0
+              AND NOT (topics LIKE '%autonomous%' AND turn_count < 30)
+            ORDER BY last_ts DESC LIMIT 1
+        """, (f'%{topic.lower()}%',)).fetchone()
+
+        row_last = conn.execute("""
+            SELECT session_id, last_ts, turn_count, milestone_detected, deploy_detected, topics
+            FROM sessions_meta
+            WHERE topics LIKE ? AND turn_count > 5
+            ORDER BY last_ts DESC LIMIT 1
+        """, (f'%{topic.lower()}%',)).fetchone()
+
+        print(f"\n\033[1m{'='*60}\033[0m")
+        print(f"  OPEN: '{topic}'")
+        print(f"\033[1m{'='*60}\033[0m\n")
+
+        if row_open:
+            sid, ts, tc, ms, dp, topics_json = row_open
+            sid_short = sid[:8]
+            import json as _json
+            topics_list = _json.loads(topics_json) if topics_json else []
+            print(f"  [OFFEN] {ts[:16]}  [{sid_short}]  ({tc} Turns)")
+            print(f"          Topics: {topics_list}")
+            print(f"          \033[36m→ read-session {sid_short} --context\033[0m")
+        else:
+            print("  Keine offene Session gefunden (alle Abgeschlossen oder <5 Turns).")
+
+        if row_last and (not row_open or row_last[0] != row_open[0]):
+            sid, ts, tc, ms, dp, topics_json = row_last
+            sid_short = sid[:8]
+            import json as _json
+            status = "✅ Abgeschlossen" if (ms or dp) else "🔄 In Progress"
+            print(f"\n  [LETZTER STAND] {ts[:16]}  [{sid_short}]  ({tc} Turns)  {status}")
+            print(f"          \033[36m→ read-session {sid_short} --last 5\033[0m")
+        print()
+        return
+
+    if args.briefing:
+        generate_briefing(args.briefing)
+        return
+
+    if args.stats:
+        print_stats()
+        return
+
+    if getattr(args, "fingerprint_all", False):
+        fingerprint_all(verbose=True)
+        return
+
+    if getattr(args, "list_milestones", False):
+        list_milestones(project=args.project, since=args.since)
+        return
+
+    if getattr(args, "list_topics", False):
+        list_topics(project=args.project)
+        return
+
+    if args.index and args.embed:
+        build_index(force=args.force)
+        build_embeddings()
+        return
+
+    if args.index:
+        build_index(force=args.force)
+        return
+
+    if args.embed:
+        build_embeddings()
+        return
+
+    query = " ".join(args.query) if args.query else ""
+    t0 = time.time()
+
+    milestone_f = args.milestone
+    deployed_f  = args.deployed
+
+    # FIX 1: Leerer Query + --milestone/--deployed → direkte DB-Abfrage ohne FTS5
+    if not query.strip() and (milestone_f or deployed_f):
+        results = search_direct_filter(
+            milestone_only=milestone_f,
+            deployed_only=deployed_f,
+            project=args.project,
+            since=args.since,
+            limit=args.limit,
+            oldest_first=getattr(args, "oldest", False),
+        )
+        flags = []
+        if milestone_f:
+            flags.append("--milestone")
+        if deployed_f:
+            flags.append("--deployed")
+        mode = "DIRECT [" + " ".join(flags) + "]"
+        elapsed = time.time() - t0
+        print_results(results, "(alle)", mode, elapsed)
+        return
+
+    if not query.strip():
+        parser.print_help()
+        return
+
+    oldest_f = getattr(args, "oldest", False)
+
+    # --unique braucht mehr Rohdaten damit nach Dedup genug unique Sessions übrig bleiben
+    unique_f = getattr(args, "unique", False)
+    fetch_limit = args.limit * 8 if unique_f else args.limit
+
+    if args.hybrid:
+        bm25_results = search_bm25(query, args.project, args.role, args.since, fetch_limit * 2,
+                                   any_mode=args.any,
+                                   milestone_only=milestone_f, deployed_only=deployed_f,
+                                   oldest_first=oldest_f)
+        sem_results = search_semantic(query, args.project, args.role, args.since, fetch_limit * 2,
+                                      milestone_only=milestone_f, deployed_only=deployed_f,
+                                      oldest_first=oldest_f)
+        results = reciprocal_rank_fusion(bm25_results, sem_results)[:fetch_limit]
+        mode = "HYBRID (BM25 + Semantic)"
+    elif args.semantic:
+        results = search_semantic(query, args.project, args.role, args.since, fetch_limit,
+                                  milestone_only=milestone_f, deployed_only=deployed_f,
+                                  oldest_first=oldest_f)
+        mode = "SEMANTIC"
+    else:
+        results = search_bm25(query, args.project, args.role, args.since, fetch_limit,
+                               any_mode=args.any,
+                               milestone_only=milestone_f, deployed_only=deployed_f,
+                               oldest_first=oldest_f)
+        mode = "BM25 (OR)" if args.any else "BM25"
+
+    if oldest_f:
+        mode += " [--oldest]"
+
+    if milestone_f:
+        mode += " [--milestone]"
+    if deployed_f:
+        mode += " [--deployed]"
+
+    # --unique: Pro Session nur den besten Treffer behalten, dann auf limit kürzen
+    if unique_f and results:
+        seen_sids = set()
+        unique_results = []
+        for r in results:
+            sid = r.get("session_id", "")
+            if sid not in seen_sids:
+                seen_sids.add(sid)
+                unique_results.append(r)
+                if len(unique_results) >= args.limit:
+                    break
+        results = unique_results
+        mode += " [--unique]"
+
+    elapsed = time.time() - t0
+    # OR-Term-Check: welche Terms hatten 0 Treffer?
+    _zero_terms = []
+    if args.any and query and " " in query:
+        try:
+            _conn_check = get_db()
+            for _t in query.split():
+                if len(_t) > 2:
+                    _n = _conn_check.execute("SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?", (_t,)).fetchone()[0]
+                    if _n == 0:
+                        _zero_terms.append(_t)
+        except Exception:
+            pass
+    print_results(results, query, mode, elapsed, any_mode=args.any, zero_terms=_zero_terms or None)
+
+
+if __name__ == "__main__":
+    main()
