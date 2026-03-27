@@ -191,34 +191,145 @@ The fix that took two hours the first time takes two minutes the second.
 
 ---
 
-### 📊 Understand how you actually work
+### 📊 See where your time actually goes
 
-**The situation:** You want to know where you've been spending your time — which projects, which topics, where problems keep coming back.
+**The situation:** You think you've been working on feature development. The data says otherwise.
 
 **What you do:** `existenz --analyze topics`
 
 **What you get:**
 
 ```
-  backend-api            ████████████████████████████   312 sessions  (24.1%)
-  authentication         █████████████████████████░░░   289 sessions  (22.3%)
-  deployment             ████████████████████████░░░░   241 sessions  (18.6%)
-  database               ████████████████░░░░░░░░░░░░   178 sessions  (13.7%)
-  frontend               ██████████░░░░░░░░░░░░░░░░░░   113 sessions  (8.7%)
+  authentication         ████████████████████████████   312 sessions  (24.1%)
+  deployment             █████████████████████████░░░   289 sessions  (22.3%)
+  database-migrations    ██████████░░░░░░░░░░░░░░░░░░   113 sessions  ( 8.7%)
+  feature-development    █████░░░░░░░░░░░░░░░░░░░░░░░    61 sessions  ( 4.7%)
   ...
   12 topics total · 1294 sessions analyzed
 ```
 
-Six analytics modes, no setup required:
+You thought you were building. You were mostly firefighting auth and deployments. That's the kind of clarity that changes how you plan the next quarter.
 
-| Mode | What it shows |
-|---|---|
-| `--analyze topics` | Topic ranking — which subjects dominate your session history |
-| `--analyze projects` | Sessions, turns, hours, milestones, and deploys per project |
-| `--analyze errors` | Error frequency by project and week — where things break most |
-| `--analyze friction` | Recurring pain points — "same issue again", "still not working" |
-| `--analyze timeline` | Activity heatmap — when you were most active, week by week |
-| `--analyze <keyword>` | Any keyword's frequency over time and across projects |
+---
+
+### 🔥 Find out which project is actually draining you
+
+**The situation:** One project always feels harder than the others. You suspect it — but you've never had the numbers.
+
+**What you do:** `existenz --analyze projects`
+
+**What you get:**
+
+```
+  Project                          Sessions   Turns  Hours     ✓     🚀
+  ──────────────────────────────── ──────── ─────── ────── ───── ─────
+  payment-service       ████████████  87      9.241   312h    3    41
+  user-dashboard        ██████░░░░░░  52      4.118   148h   18    12
+  onboarding-flow       ████░░░░░░░░  31      1.204    38h    9     8
+  internal-tooling      █░░░░░░░░░░░   9        312    11h    4     2
+```
+
+`payment-service`: 312 hours, only 3 milestones reached, but 41 deploys — a project stuck in endless iteration. `user-dashboard`: 148 hours, 18 milestones — healthy velocity. The pattern is visible in seconds.
+
+Use it to: justify a refactor, identify where you need more planning, or simply explain to a client why a project costs what it costs.
+
+---
+
+### 🐛 Identify your real error hotspots
+
+**The situation:** You know some parts of your stack break more than others — but you're working from gut feeling.
+
+**What you do:** `existenz --analyze errors`
+
+**What you get:**
+
+```
+  Errors by project:
+  payment-service            ████████████████████████████   186x
+  data-pipeline              █████████████████░░░░░░░░░░░   124x
+  auth-service               ████████░░░░░░░░░░░░░░░░░░░░    62x
+
+  Trend (last 12 weeks):
+  KW 2026-01   ████░░░░░░░░░░░░░░░░░░    18x
+  KW 2026-07   ████████████░░░░░░░░░░    51x   ← spike
+  KW 2026-12   ██████████████████████    89x   ← ongoing
+```
+
+The payment service has 3× more error turns than anything else. And errors are accelerating, not stabilizing. That's not bad luck — that's a structural problem that needs addressing. Now you have the evidence to act on it.
+
+---
+
+### ⚠️ Discover what you keep fighting with
+
+**The situation:** Some problems feel solved — until they come back. Again. And again.
+
+**What you do:** `existenz --analyze friction`
+
+**What you get:**
+
+```
+  Friction by project:
+  ⚠️ data-pipeline              ████████████████████████████   94x
+  ⚠️ deployment-scripts         ████████████████░░░░░░░░░░░░   61x
+     auth-service               ███░░░░░░░░░░░░░░░░░░░░░░░░░   12x
+
+  Friction by topic:
+  docker                     ████████████████████████████   47x
+  environment-variables      ██████████████░░░░░░░░░░░░░░   31x
+  database-connections       ████████████░░░░░░░░░░░░░░░░   28x
+```
+
+ExistenZ detects turns where you said "same issue", "still not working", "again" — across all sessions, across all time. The result: a ranked list of the things that keep slowing you down. Docker config and env vars make the top 3. That's not a project problem — that's a tooling problem worth fixing once and for all.
+
+---
+
+### 📅 See your actual work rhythm
+
+**The situation:** You want to understand your productivity patterns — when you're in deep work, when you're coasting, where the peaks and valleys are.
+
+**What you do:** `existenz --analyze timeline`
+
+**What you get:**
+
+```
+  ·  KW 2025-48   ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░   12 sessions
+  ·  KW 2025-49   ███████████░░░░░░░░░░░░░░░░░░░░░░   34 sessions
+  🔥 KW 2025-50   ████████████████████████████████  102 sessions  ← sprint
+  ·  KW 2025-51   ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    7 sessions  ← recovery
+  📈 KW 2026-02   ██████████████████░░░░░░░░░░░░░░   58 sessions
+```
+
+Week 50: a full sprint — 102 sessions, barely any milestones reached. Week 51: 7 sessions. That's a burnout pattern. Visible only because the data was there. Useful for planning: knowing your actual capacity versus your assumed capacity.
+
+---
+
+### 📈 Track how any concept evolves over time
+
+**The situation:** You've been gradually migrating from REST to GraphQL. You want to see if it's actually happening — or just something you talk about.
+
+**What you do:** `existenz --analyze graphql`
+
+**What you get:**
+
+```
+  KEYWORD ANALYSIS — "graphql"
+  89 mentions · 34 sessions · 3 projects
+
+  Frequency by project:
+  api-gateway                ████████████████████████████    52x
+  mobile-client              ████████████░░░░░░░░░░░░░░░░    24x
+  internal-tools             ██░░░░░░░░░░░░░░░░░░░░░░░░░░     5x
+
+  Trend over time:
+  ↓ KW 2025-40    ████░░░░░░░░░░░░░░░░░░░░     3x
+  → KW 2025-48    █████████░░░░░░░░░░░░░░░░     7x
+  ↑ KW 2026-04    ████████████████████████    19x   ← adoption accelerating
+  ↑ KW 2026-12    ████████████████████████████  24x
+```
+
+The migration is real and accelerating. You can show this to a stakeholder — or use it to decide when to retire the old REST endpoints.
+
+Works for any keyword: a technology you're adopting, a client name, a concept you're exploring, a problem that keeps coming up.
 
 ---
 
